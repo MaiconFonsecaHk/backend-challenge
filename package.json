@@ -6,12 +6,17 @@
   "packageManager": "bun@1.4.2",
   "scripts": {
     "build": "nest build",
+    "migration:down": "mikro-orm migration:down",
+    "migration:list": "mikro-orm migration:list",
+    "migration:pending": "mikro-orm migration:pending",
+    "migration:up": "mikro-orm migration:up",
     "start": "bun run src/main.ts",
     "start:dev": "bun --watch src/main.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@mikro-orm/core": "7.2.4",
+    "@mikro-orm/migrations": "7.2.4",
     "@mikro-orm/nestjs": "7.1.0",
     "@mikro-orm/postgresql": "7.2.4",
     "@nestjs/common": "^12.1.2",
@@ -23,8 +28,17 @@
     "zod": "4.6.5"
   },
   "devDependencies": {
+    "@mikro-orm/cli": "7.2.4",
     "@nestjs/cli": "^12.0.8",
     "@types/bun": "^1.4.2",
+    "tsx": "4.23.15",
     "typescript": "^6.0.3"
+  },
+  "mikro-orm": {
+    "configPaths": [
+      "./src/infrastructure/persistence/mikro-orm.config.ts",
+      "./dist/infrastructure/persistence/mikro-orm.config.js"
+    ],
+    "preferTs": true
   }
 }
