@@ -40,7 +40,7 @@ AppModule
     └── SQS health indicator ── AWS SDK v3 ── MiniStack/SQS
 ```
 
-Ainda não existem endpoints financeiros, entidades de domínio, consumidor SQS, inbox, outbox ou workers. Eles serão adicionados nas fases específicas do roadmap.
+Ainda não existem endpoints financeiros, aggregates, entidades persistentes, consumidor SQS, inbox, outbox ou workers. O único elemento financeiro implementado até aqui é o value object `Money`; os demais serão adicionados nas fases específicas do roadmap.
 
 ## 4. Boundaries e dependências
 
@@ -129,13 +129,23 @@ O baseline atual não cria tabelas de domínio. Sua função é provar a cadeia 
 - **Escolha:** erros esperados do domínio derivam de `DomainError` e expõem um código estável; casos de uso dependerão das portas `Clock` e `IdGenerator`; `SystemClock` é o adapter concreto mínimo disponível. Nenhum gerador concreto de ID foi escolhido ainda.
 - **Evidência:** testes do contrato básico de `DomainError` e do adapter `SystemClock`, além do type-check das portas puras.
 
+### D-009 — `Money` com aritmética decimal exata
+
+- **Status:** confirmada para o domínio puro; o mapeamento no PostgreSQL continua aberto.
+- **Requisito protegido:** dinheiro nunca usa `number`, mantém escala fixa de duas casas na entrada e na saída e não permite operações entre moedas diferentes.
+- **Alternativas consideradas:** `number` foi rejeitado por não representar decimais financeiros exatamente; `decimal.js` foi descartado para este conjunto de operações porque aplica uma precisão global aos resultados; representação apenas em minor units com `bigint` foi descartada porque o desafio pede uma biblioteca decimal exata e uma representação decimal explícita.
+- **Trade-off:** o domínio expõe somente soma, subtração, negação e comparações, operações que o `big.js` executa exatamente. Divisão, raiz e potências não fazem parte do contrato de `Money`. A moeda é validada no formato canônico ISO-4217 alpha-3; a lista de moedas habilitadas pelo produto será uma política do contrato de entrada, sendo `BRL` suficiente para o desafio.
+- **Escolha:** `big.js` `7.0.1`, com tipos fixados em `@types/big.js` `7.0.0`. `Money` recebe e serializa strings com duas casas, preserva sua instância imutável e cria novos valores em todas as operações. Valores assinados são aceitos no value object porque diferenças e reversões podem ser negativas; contratos que representam quantias positivas devem rejeitá-los explicitamente antes de executar o caso de uso.
+- **Evidência:** testes unitários cobrem escala, formato inválido, serialização canônica, imutabilidade, zero, soma, subtração, negação, sinais, comparações, valores além do limite seguro do JavaScript, moedas diferentes e códigos de erro estáveis.
+- **Limitação e gatilho de revisão:** a representação em colunas PostgreSQL e o round-trip pelo ORM só serão definidos na fase de persistência, com teste contra banco real.
+
 ## 6. Decisões abertas
 
 Nenhuma alternativa desta tabela está escolhida antecipadamente.
 
 | Decisão | Requisito protegido | Alternativas que precisam ser avaliadas | Evidência necessária para fechar |
 | --- | --- | --- | --- |
-| Biblioteca e mapeamento de `Money` | precisão decimal e moeda consistente | bibliotecas decimais exatas e formas de persistência PostgreSQL | testes de parsing, aritmética, serialização e round-trip no banco |
+| Mapeamento persistente de `Money` | precisão decimal e moeda consistente no PostgreSQL | colunas separadas para valor/moeda e formas de conversão do MikroORM | teste de round-trip contra banco real sem perda de escala ou precisão |
 | Estratégia de IDs | unicidade e ordenação quando necessária | UUID gerado na aplicação, UUID no banco ou outra estratégia justificada | testes de geração, persistência e concorrência |
 | Autoridade dos timestamps | resultados testáveis e timestamps consistentes | instante fornecido pelo `Clock`, timestamp do PostgreSQL ou combinação documentada | testes determinísticos, persistência e comportamento entre instâncias |
 | Limite transacional | atomicidade de wallet, ledger, transação, inbox e outbox | desenho do caso de uso e escopo do `EntityManager.transactional()` | testes de rollback e falha antes/depois do commit |
@@ -186,11 +196,11 @@ bun run migration:up
 bun run migration:down
 ```
 
-O ciclo de migration deve ser comprovado em banco descartável antes de alterações reais de schema. Testes de integração e concorrência serão adicionados nas fases correspondentes; o teste atual comprova apenas o runner do Bun e a normalização básica da configuração.
+O ciclo de migration deve ser comprovado em banco descartável antes de alterações reais de schema. Testes de integração e concorrência serão adicionados nas fases correspondentes; os testes atuais comprovam o runner do Bun, a normalização básica da configuração e o comportamento puro de `Money`.
 
 ## 10. Limitações atuais
 
-- não existe modelo de domínio financeiro;
+- o modelo de domínio financeiro ainda está limitado ao value object `Money`;
 - não existem tabelas de negócio ou constraints financeiras;
 - não existem endpoints de wallet, wagering ou ledger;
 - não existem consumer, inbox, outbox ou publisher;
