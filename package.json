@@ -12,6 +12,7 @@
     "migration:up": "mikro-orm migration:up",
     "start": "bun run src/main.ts",
     "start:dev": "bun --watch src/main.ts",
+    "test": "bun test --check",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
