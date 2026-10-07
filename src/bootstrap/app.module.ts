@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 
 import { environmentSchema } from '../config/environment.schema.js';
+import { PersistenceModule } from '../infrastructure/persistence/persistence.module.js';
 
 @Module({
   imports: [
@@ -11,6 +12,7 @@ import { environmentSchema } from '../config/environment.schema.js';
       skipProcessEnv: true,
       validationSchema: environmentSchema,
     }),
+    PersistenceModule,
   ],
 })
 export class AppModule {}
