@@ -40,7 +40,7 @@ AppModule
     └── SQS health indicator ── AWS SDK v3 ── MiniStack/SQS
 ```
 
-Ainda não existem endpoints financeiros, aggregates, entidades persistentes, consumidor SQS, inbox, outbox ou workers. O único elemento financeiro implementado até aqui é o value object `Money`; os demais serão adicionados nas fases específicas do roadmap.
+Ainda não existem endpoints financeiros, entidades persistentes, consumidor SQS, inbox, outbox ou workers. O domínio puro implementado até aqui contém `Money` e o aggregate `Wallet`; os demais elementos serão adicionados nas fases específicas do roadmap.
 
 ## 4. Boundaries e dependências
 
@@ -139,6 +139,16 @@ O baseline atual não cria tabelas de domínio. Sua função é provar a cadeia 
 - **Evidência:** testes unitários cobrem escala, formato inválido, serialização canônica, imutabilidade, zero, soma, subtração, negação, sinais, comparações, valores além do limite seguro do JavaScript, moedas diferentes e códigos de erro estáveis.
 - **Limitação e gatilho de revisão:** a representação em colunas PostgreSQL e o round-trip pelo ORM só serão definidos na fase de persistência, com teste contra banco real.
 
+### D-010 — Transições locais da `Wallet` produzem uma mudança de saldo explícita
+
+- **Status:** confirmada para o domínio puro; atomicidade, unicidade e concorrência continuam abertas até a implementação da persistência e dos casos de uso.
+- **Requisito protegido:** saldo nunca negativo, moeda consistente, versão iniciada em `1` e incrementada somente quando o saldo muda, além da correspondência futura entre cada movimento e um lançamento do ledger.
+- **Alternativas consideradas:** métodos que apenas alteram o saldo e retornam `void` foram rejeitados porque ocultariam os valores anterior e posterior necessários ao ledger; criar e persistir o ledger dentro do aggregate foi rejeitado porque acoplaria o domínio à infraestrutura e à transação SQL.
+- **Trade-off:** `credit` e `debit` alteram o estado local e retornam um `WalletBalanceChange` imutável com direção, valor, saldos anterior/posterior e nova versão. O retorno torna a mudança explícita, mas a garantia atômica de persistir wallet e ledger ainda pertence ao caso de uso e ao PostgreSQL.
+- **Escolha:** abertura aceita saldo zero ou positivo, inicia a versão em `1` e recebe o instante externamente; créditos e débitos exigem valores positivos da mesma moeda; overdraft falha antes de qualquer mutação; `rehydrate` reconstrói o estado persistido sem repetir validações de transição; cópias defensivas impedem mutação externa dos timestamps.
+- **Evidência:** testes unitários cobrem abertura, saldo zero, identidade, saldo inicial negativo, crédito, débito até zero, overdraft sem mutação, moedas divergentes, movimentos não positivos, versionamento, timestamps defensivos, reidratação e códigos de erro estáveis.
+- **Limitação e gatilho de revisão:** a unicidade de `(playerId, currency)`, a atomicidade com `OPENING` e ledger, o controle de concorrência e a não-negatividade no schema só estarão garantidos após migrations e testes reais de PostgreSQL.
+
 ## 6. Decisões abertas
 
 Nenhuma alternativa desta tabela está escolhida antecipadamente.
@@ -164,7 +174,7 @@ Nenhuma alternativa desta tabela está escolhida antecipadamente.
 
 ## 7. Modelo transacional — estado atual
 
-O modelo transacional financeiro permanece aberto porque as entidades ainda não foram implementadas. A restrição já estabelecida é:
+O modelo transacional financeiro permanece aberto. `Wallet` já expressa mudanças locais de saldo, mas os casos de uso, o ledger e as garantias de persistência ainda não foram implementados. A restrição estabelecida é:
 
 ```text
 wallet + ledger + wager transaction + inbox + outbox
@@ -196,11 +206,11 @@ bun run migration:up
 bun run migration:down
 ```
 
-O ciclo de migration deve ser comprovado em banco descartável antes de alterações reais de schema. Testes de integração e concorrência serão adicionados nas fases correspondentes; os testes atuais comprovam o runner do Bun, a normalização básica da configuração e o comportamento puro de `Money`.
+O ciclo de migration deve ser comprovado em banco descartável antes de alterações reais de schema. Testes de integração e concorrência serão adicionados nas fases correspondentes; os testes atuais comprovam o runner do Bun, a normalização básica da configuração e o comportamento puro de `Money` e `Wallet`.
 
 ## 10. Limitações atuais
 
-- o modelo de domínio financeiro ainda está limitado ao value object `Money`;
+- o modelo de domínio financeiro ainda está limitado a `Money` e `Wallet`;
 - não existem tabelas de negócio ou constraints financeiras;
 - não existem endpoints de wallet, wagering ou ledger;
 - não existem consumer, inbox, outbox ou publisher;
