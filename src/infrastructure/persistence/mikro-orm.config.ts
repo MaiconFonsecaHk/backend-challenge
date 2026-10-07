@@ -1,9 +1,9 @@
 import { Migrator } from '@mikro-orm/migrations';
 import { defineConfig } from '@mikro-orm/postgresql';
 
-import { environmentSchema } from '../../config/environment.schema.js';
+import { databaseEnvironmentSchema } from '../../config/environment.schema.js';
 
-const environment = environmentSchema.parse(process.env);
+const environment = databaseEnvironmentSchema.parse(process.env);
 
 export default defineConfig({
   dbName: environment.POSTGRES_DB,
