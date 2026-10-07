@@ -1,6 +1,7 @@
 # Local planning documents
 docs/roadmap.md
 docs/regras-inviolaveis.md
+docs/how_to_commit.md
 
 # Installed dependencies
 node_modules/
