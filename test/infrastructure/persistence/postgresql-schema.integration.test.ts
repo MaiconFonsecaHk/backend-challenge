@@ -16,6 +16,10 @@ import type {
 import { PersistentWagerTransactionProcessor } from '../../../src/application/services/persistent-wager-transaction.processor.js';
 import { WagerPayloadFingerprintService } from '../../../src/application/services/wager-payload-fingerprint.js';
 import { WagerTransactionExecutor } from '../../../src/application/services/wager-transaction.executor.js';
+import {
+  GetProviderWagerTransactionUseCase,
+  GetWagerTransactionByIdUseCase,
+} from '../../../src/application/use-cases/wagering/get-wager-transaction.use-cases.js';
 import { ProcessWagerTransactionUseCase } from '../../../src/application/use-cases/wagering/process-wager-transaction.use-case.js';
 import { CreateWalletUseCase } from '../../../src/application/use-cases/wallet/create-wallet.use-case.js';
 import { GetWalletLedgerUseCase } from '../../../src/application/use-cases/wallet/get-wallet-ledger.use-case.js';
@@ -958,6 +962,41 @@ describePostgreSql('PostgreSQL schema integration', () => {
       status: WagerTransactionStatus.PendingReference,
       balance: { amount: '100.00', currency: 'BRL' },
     });
+
+    const getById = new GetWagerTransactionByIdUseCase(unitOfWork);
+    const getByProvider = new GetProviderWagerTransactionUseCase(unitOfWork);
+    const betSnapshot = await getById.execute(bet.transactionId);
+    expect(betSnapshot).toMatchObject({
+      transactionId: bet.transactionId,
+      providerId: 'provider-rules',
+      externalTransactionId: 'bet-112',
+      kind: WagerTransactionKind.Bet,
+      status: WagerTransactionStatus.Processed,
+      money: { amount: '25.00', currency: 'BRL' },
+      balance: { amount: '75.00', currency: 'BRL' },
+      createdAt: PROCESSED_AT.toISOString(),
+      processedAt: PROCESSED_AT.toISOString(),
+    });
+    expect(
+      await getByProvider.execute({
+        providerId: 'provider-rules',
+        externalTransactionId: 'bet-112',
+      }),
+    ).toEqual(betSnapshot);
+    expect(await getById.execute(duplicateRefund.transactionId)).toMatchObject({
+      status: WagerTransactionStatus.Rejected,
+      failureCode: 'REFERENCE_ALREADY_REVERSED',
+      balance: { amount: '100.00', currency: 'BRL' },
+    });
+    const pendingSnapshot = await getById.execute(
+      pendingRollback.transactionId,
+    );
+    expect(pendingSnapshot).toMatchObject({
+      status: WagerTransactionStatus.PendingReference,
+      referenceExternalTransactionId: 'missing-112',
+      balance: { amount: '100.00', currency: 'BRL' },
+    });
+    expect(pendingSnapshot).not.toHaveProperty('processedAt');
 
     expect(await new ReconcileWalletUseCase(unitOfWork).execute(walletId)).toEqual({
       walletId,

@@ -13,6 +13,10 @@ import {
 import { PersistentWagerTransactionProcessor } from '../application/services/persistent-wager-transaction.processor.js';
 import { WagerPayloadFingerprintService } from '../application/services/wager-payload-fingerprint.js';
 import { WagerTransactionExecutor } from '../application/services/wager-transaction.executor.js';
+import {
+  GetProviderWagerTransactionUseCase,
+  GetWagerTransactionByIdUseCase,
+} from '../application/use-cases/wagering/get-wager-transaction.use-cases.js';
 import { ProcessWagerTransactionUseCase } from '../application/use-cases/wagering/process-wager-transaction.use-case.js';
 import { Sha256PayloadDigest } from '../infrastructure/cryptography/sha256-payload-digest.js';
 import { UuidGenerator } from '../infrastructure/identity/uuid-generator.js';
@@ -65,7 +69,23 @@ import { SystemClock } from '../infrastructure/time/system-clock.js';
         payloadFingerprint: WagerPayloadFingerprintService,
       ) => new ProcessWagerTransactionUseCase(processor, payloadFingerprint),
     },
+    {
+      provide: GetWagerTransactionByIdUseCase,
+      inject: [PERSISTENCE_UNIT_OF_WORK],
+      useFactory: (unitOfWork: UnitOfWork) =>
+        new GetWagerTransactionByIdUseCase(unitOfWork),
+    },
+    {
+      provide: GetProviderWagerTransactionUseCase,
+      inject: [PERSISTENCE_UNIT_OF_WORK],
+      useFactory: (unitOfWork: UnitOfWork) =>
+        new GetProviderWagerTransactionUseCase(unitOfWork),
+    },
   ],
-  exports: [ProcessWagerTransactionUseCase],
+  exports: [
+    ProcessWagerTransactionUseCase,
+    GetWagerTransactionByIdUseCase,
+    GetProviderWagerTransactionUseCase,
+  ],
 })
 export class WageringApplicationModule {}

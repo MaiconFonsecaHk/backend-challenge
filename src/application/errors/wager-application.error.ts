@@ -25,3 +25,11 @@ export class IdempotencyConflictError extends ApplicationError {
     );
   }
 }
+
+export class WagerTransactionNotFoundError extends ApplicationError {
+  readonly code = 'WAGER_TRANSACTION_NOT_FOUND';
+
+  constructor() {
+    super('Wager transaction was not found.');
+  }
+}
