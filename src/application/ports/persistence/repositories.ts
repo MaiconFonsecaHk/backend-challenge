@@ -2,7 +2,10 @@ import type { WalletLedgerEntry } from '../../../domain/ledger/wallet-ledger-ent
 import type { InboxMessage } from '../../../domain/messaging/inbox-message.js';
 import type { OutboxMessage } from '../../../domain/messaging/outbox-message.js';
 import type { Money } from '../../../domain/shared/value-objects/money.js';
-import type { WagerTransaction } from '../../../domain/wagering/wager-transaction.js';
+import type {
+  WagerTransaction,
+  WagerTransactionKind,
+} from '../../../domain/wagering/wager-transaction.js';
 import type { Wallet } from '../../../domain/wallet/wallet.js';
 
 export interface WalletRepository {
@@ -36,6 +39,10 @@ export interface WagerTransactionRepository {
   findByProviderTransaction(
     providerId: string,
     externalTransactionId: string,
+  ): Promise<WagerTransactionRecord | undefined>;
+  findByReferenceAndKind(
+    referenceTransactionId: string,
+    kind: WagerTransactionKind,
   ): Promise<WagerTransactionRecord | undefined>;
   add(record: WagerTransactionRecord): Promise<void>;
   save(record: WagerTransactionRecord): Promise<void>;

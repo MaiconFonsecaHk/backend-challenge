@@ -227,6 +227,10 @@ describe('MikroORM repositories', () => {
     await repository.findById(TRANSACTION_ID);
     await repository.findByIdempotencyKey('provider-a:external-1');
     await repository.findByProviderTransaction('provider-a', 'external-1');
+    await repository.findByReferenceAndKind(
+      TRANSACTION_ID,
+      WagerTransactionKind.Refund,
+    );
     await repository.add(pendingRecord);
     domainTransaction.markProcessed(undefined, UPDATED_AT);
     await repository.save(transactionRecord(domainTransaction, brl('75.00')));
@@ -235,6 +239,10 @@ describe('MikroORM repositories', () => {
       { id: TRANSACTION_ID },
       { idempotencyKey: 'provider-a:external-1' },
       { providerId: 'provider-a', externalTransactionId: 'external-1' },
+      {
+        referenceTransactionId: TRANSACTION_ID,
+        kind: WagerTransactionKind.Refund,
+      },
       { id: TRANSACTION_ID },
     ]);
     expect(double.persisted[0]).toBeInstanceOf(

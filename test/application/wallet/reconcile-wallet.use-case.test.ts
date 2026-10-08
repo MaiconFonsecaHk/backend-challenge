@@ -41,6 +41,7 @@ function reconciliationContext(snapshot?: WalletReconciliationSnapshot): {
       findById: async () => undefined,
       findByIdempotencyKey: async () => undefined,
       findByProviderTransaction: async () => undefined,
+      findByReferenceAndKind: async () => undefined,
       add: unexpectedWrite,
       save: unexpectedWrite,
     },

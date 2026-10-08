@@ -15,6 +15,7 @@ import type {
 } from '../../../src/application/ports/wager-transaction-processor.js';
 import { PersistentWagerTransactionProcessor } from '../../../src/application/services/persistent-wager-transaction.processor.js';
 import { WagerPayloadFingerprintService } from '../../../src/application/services/wager-payload-fingerprint.js';
+import { WagerTransactionExecutor } from '../../../src/application/services/wager-transaction.executor.js';
 import { ProcessWagerTransactionUseCase } from '../../../src/application/use-cases/wagering/process-wager-transaction.use-case.js';
 import { CreateWalletUseCase } from '../../../src/application/use-cases/wallet/create-wallet.use-case.js';
 import { GetWalletLedgerUseCase } from '../../../src/application/use-cases/wallet/get-wallet-ledger.use-case.js';
@@ -34,6 +35,7 @@ import {
 import { Wallet } from '../../../src/domain/wallet/wallet.js';
 import { PERSISTENCE_ENTITIES } from '../../../src/infrastructure/persistence/entities/persistence-entities.js';
 import { Sha256PayloadDigest } from '../../../src/infrastructure/cryptography/sha256-payload-digest.js';
+import { UuidGenerator } from '../../../src/infrastructure/identity/uuid-generator.js';
 import { Migration20261007155000Baseline } from '../../../src/infrastructure/persistence/migrations/Migration20261007155000Baseline.js';
 import { Migration20261008015154_create_persistence_tables } from '../../../src/infrastructure/persistence/migrations/Migration20261008015154_create_persistence_tables.js';
 import { Migration20261008021520_enforce_persistence_constraints } from '../../../src/infrastructure/persistence/migrations/Migration20261008021520_enforce_persistence_constraints.js';
@@ -226,6 +228,22 @@ async function createIndependentApplicationOrm(
 
 function money(amount: string): Money {
   return Money.from({ amount, currency: 'BRL' });
+}
+
+function createFinancialUseCase(orm: MikroORM): ProcessWagerTransactionUseCase {
+  const unitOfWork = new MikroOrmUnitOfWork(orm);
+
+  return new ProcessWagerTransactionUseCase(
+    new PersistentWagerTransactionProcessor(
+      unitOfWork,
+      new WagerTransactionExecutor(
+        new UuidGenerator(),
+        new FixedClock(PROCESSED_AT),
+      ),
+      new MikroOrmPersistenceConflictClassifier(),
+    ),
+    new WagerPayloadFingerprintService(new Sha256PayloadDigest()),
+  );
 }
 
 function postgresErrorDetails(error: unknown): PostgreSqlErrorDetails {
@@ -850,6 +868,280 @@ describePostgreSql('PostgreSQL schema integration', () => {
     } finally {
       await Promise.all(instances.map((orm) => orm.close(true)));
     }
+  });
+
+  test('applies every wagering rule atomically and keeps wallet equal to its ledger', async () => {
+    const walletId = '10000000-0000-4000-8000-000000000112';
+    const playerId = '20000000-0000-4000-8000-000000000112';
+    const unitOfWork = new MikroOrmUnitOfWork(requiredApplicationOrm());
+    await new CreateWalletUseCase(
+      unitOfWork,
+      new SequenceIdGenerator([
+        walletId,
+        '30000000-0000-4000-8000-000000000112',
+        '40000000-0000-4000-8000-000000000112',
+        '50000000-0000-4000-8000-000000000112',
+      ]),
+      new FixedClock(CREATED_AT),
+    ).execute({
+      playerId,
+      initialBalance: { amount: '100.00', currency: 'BRL' },
+      correlationId: 'wallet-create-integration-112',
+    });
+    const useCase = createFinancialUseCase(requiredApplicationOrm());
+    const submit = (
+      externalTransactionId: string,
+      kind: WagerTransactionKind,
+      amount: string,
+      referenceExternalTransactionId?: string,
+    ) =>
+      useCase.execute({
+        providerId: 'provider-rules',
+        externalTransactionId,
+        idempotencyKey: `provider-rules:${externalTransactionId}`,
+        playerId,
+        walletId,
+        roundId: 'round-rules-112',
+        gameId: 'game-rules-112',
+        kind,
+        money: { amount, currency: 'BRL' },
+        ...(referenceExternalTransactionId === undefined
+          ? {}
+          : { referenceExternalTransactionId }),
+        correlationId: `correlation-${externalTransactionId}`,
+      });
+
+    const bet = await submit('bet-112', WagerTransactionKind.Bet, '25.00');
+    const win = await submit('win-112', WagerTransactionKind.Win, '10.00');
+    const loss = await submit('loss-112', WagerTransactionKind.Loss, '5.00');
+    const refund = await submit(
+      'refund-112',
+      WagerTransactionKind.Refund,
+      '25.00',
+      'bet-112',
+    );
+    const rollback = await submit(
+      'rollback-112',
+      WagerTransactionKind.Rollback,
+      '10.00',
+      'win-112',
+    );
+    const duplicateRefund = await submit(
+      'refund-duplicate-112',
+      WagerTransactionKind.Refund,
+      '25.00',
+      'bet-112',
+    );
+    const pendingRollback = await submit(
+      'rollback-pending-112',
+      WagerTransactionKind.Rollback,
+      '8.00',
+      'missing-112',
+    );
+
+    expect([bet, win, loss, refund, rollback].map((result) => result.status)).toEqual(
+      Array.from({ length: 5 }, () => WagerTransactionStatus.Processed),
+    );
+    expect([bet, win, loss, refund, rollback].map((result) => result.balance?.amount)).toEqual([
+      '75.00',
+      '85.00',
+      '85.00',
+      '110.00',
+      '100.00',
+    ]);
+    expect(duplicateRefund).toMatchObject({
+      status: WagerTransactionStatus.Rejected,
+      balance: { amount: '100.00', currency: 'BRL' },
+      failureCode: 'REFERENCE_ALREADY_REVERSED',
+    });
+    expect(pendingRollback).toMatchObject({
+      status: WagerTransactionStatus.PendingReference,
+      balance: { amount: '100.00', currency: 'BRL' },
+    });
+
+    expect(await new ReconcileWalletUseCase(unitOfWork).execute(walletId)).toEqual({
+      walletId,
+      storedBalance: { amount: '100.00', currency: 'BRL' },
+      calculatedBalance: { amount: '100.00', currency: 'BRL' },
+      difference: { amount: '0.00', currency: 'BRL' },
+      consistent: true,
+      checkedEntries: 5,
+    });
+    await unitOfWork.execute(async (repositories) => {
+      expect((await repositories.wallets.findById(walletId))?.version).toBe(5);
+      expect(
+        await repositories.walletLedgerEntries.listByWallet(walletId, {
+          limit: 20,
+        }),
+      ).toHaveLength(5);
+    });
+
+    const eventCounts = await requiredApplicationOrm().em
+      .getConnection()
+      .execute<Array<{ event_type: string; count: string }>>(
+        `select event_type, count(*)::text as count
+           from outbox_messages
+          where payload -> 'data' ->> 'walletId' = ?
+          group by event_type
+          order by event_type`,
+        [walletId],
+      );
+    expect(eventCounts).toEqual([
+      { event_type: 'WagerTransactionPendingReference', count: '1' },
+      { event_type: 'WagerTransactionProcessed', count: '5' },
+      { event_type: 'WagerTransactionRejected', count: '1' },
+      { event_type: 'WalletBalanceChanged', count: '5' },
+    ]);
+  });
+
+  test('allows only one of two concurrent 80.00 bets against a 100.00 wallet', async () => {
+    const walletId = '10000000-0000-4000-8000-000000000113';
+    const playerId = '20000000-0000-4000-8000-000000000113';
+    const unitOfWork = new MikroOrmUnitOfWork(requiredApplicationOrm());
+    await new CreateWalletUseCase(
+      unitOfWork,
+      new SequenceIdGenerator([
+        walletId,
+        '30000000-0000-4000-8000-000000000113',
+        '40000000-0000-4000-8000-000000000113',
+        '50000000-0000-4000-8000-000000000113',
+      ]),
+      new FixedClock(CREATED_AT),
+    ).execute({
+      playerId,
+      initialBalance: { amount: '100.00', currency: 'BRL' },
+      correlationId: 'wallet-create-integration-113',
+    });
+
+    const instances = await Promise.all(
+      Array.from({ length: 3 }, () => createIndependentApplicationOrm([])),
+    );
+    try {
+      const first = instances[0];
+      const second = instances[1];
+      if (first === undefined || second === undefined) {
+        throw new Error('Concurrent financial processors were not created');
+      }
+      const submissions = [
+        ['bet-a-113', createFinancialUseCase(first)],
+        ['bet-b-113', createFinancialUseCase(second)],
+      ] as const;
+      const results = await Promise.all(
+        submissions.map(([externalTransactionId, useCase]) =>
+          useCase.execute({
+            providerId: 'provider-concurrency',
+            externalTransactionId,
+            idempotencyKey: `provider-concurrency:${externalTransactionId}`,
+            playerId,
+            walletId,
+            roundId: 'round-concurrency-113',
+            gameId: 'game-concurrency-113',
+            kind: WagerTransactionKind.Bet,
+            money: { amount: '80.00', currency: 'BRL' },
+            correlationId: `correlation-${externalTransactionId}`,
+          }),
+        ),
+      );
+
+      expect(
+        results.filter((result) => result.status === WagerTransactionStatus.Processed),
+      ).toHaveLength(1);
+      expect(
+        results.filter(
+          (result) =>
+            result.status === WagerTransactionStatus.Rejected &&
+            result.failureCode === 'INSUFFICIENT_FUNDS',
+        ),
+      ).toHaveLength(1);
+      expect(results.every((result) => result.balance?.amount === '20.00')).toBe(true);
+    } finally {
+      await Promise.all(instances.map((orm) => orm.close(true)));
+    }
+
+    expect(await new ReconcileWalletUseCase(unitOfWork).execute(walletId)).toEqual({
+      walletId,
+      storedBalance: { amount: '20.00', currency: 'BRL' },
+      calculatedBalance: { amount: '20.00', currency: 'BRL' },
+      difference: { amount: '0.00', currency: 'BRL' },
+      consistent: true,
+      checkedEntries: 2,
+    });
+  });
+
+  test('rolls back wallet, ledger, transaction, and outbox when a wager flush fails', async () => {
+    const walletId = '10000000-0000-4000-8000-000000000114';
+    const playerId = '20000000-0000-4000-8000-000000000114';
+    const unitOfWork = new MikroOrmUnitOfWork(requiredApplicationOrm());
+    await new CreateWalletUseCase(
+      unitOfWork,
+      new SequenceIdGenerator([
+        walletId,
+        '30000000-0000-4000-8000-000000000114',
+        '40000000-0000-4000-8000-000000000114',
+        '50000000-0000-4000-8000-000000000114',
+      ]),
+      new FixedClock(CREATED_AT),
+    ).execute({
+      playerId,
+      initialBalance: { amount: '100.00', currency: 'BRL' },
+      correlationId: 'wallet-create-integration-114',
+    });
+    const processor = new PersistentWagerTransactionProcessor(
+      unitOfWork,
+      new WagerTransactionExecutor(
+        new SequenceIdGenerator([
+          '30000000-0000-4000-8000-000000000214',
+          '40000000-0000-4000-8000-000000000214',
+          'invalid-outbox-id',
+          '50000000-0000-4000-8000-000000000214',
+        ]),
+        new FixedClock(PROCESSED_AT),
+      ),
+      new MikroOrmPersistenceConflictClassifier(),
+    );
+    const useCase = new ProcessWagerTransactionUseCase(
+      processor,
+      new WagerPayloadFingerprintService(new Sha256PayloadDigest()),
+    );
+    queryLog.length = 0;
+
+    let caught: unknown;
+    try {
+      await useCase.execute({
+        providerId: 'provider-atomicity',
+        externalTransactionId: 'bet-114',
+        idempotencyKey: 'provider-atomicity:bet-114',
+        playerId,
+        walletId,
+        roundId: 'round-atomicity-114',
+        gameId: 'game-atomicity-114',
+        kind: WagerTransactionKind.Bet,
+        money: { amount: '25.00', currency: 'BRL' },
+        correlationId: 'correlation-bet-114',
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(postgresErrorDetails(caught).code).toBe('22P02');
+    expect(queryLog.some((message) => message.includes('rollback'))).toBe(true);
+    expect(await new ReconcileWalletUseCase(unitOfWork).execute(walletId)).toEqual({
+      walletId,
+      storedBalance: { amount: '100.00', currency: 'BRL' },
+      calculatedBalance: { amount: '100.00', currency: 'BRL' },
+      difference: { amount: '0.00', currency: 'BRL' },
+      consistent: true,
+      checkedEntries: 1,
+    });
+    await unitOfWork.execute(async (repositories) => {
+      expect(
+        await repositories.wagerTransactions.findByProviderTransaction(
+          'provider-atomicity',
+          'bet-114',
+        ),
+      ).toBeUndefined();
+      expect((await repositories.wallets.findById(walletId))?.version).toBe(1);
+    });
   });
 
   test('deduplicates 50 concurrent submissions and preserves the committed result', async () => {

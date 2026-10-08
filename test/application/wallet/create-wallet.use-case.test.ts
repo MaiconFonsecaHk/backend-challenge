@@ -87,6 +87,7 @@ function persistenceDouble(existingWallet?: Wallet): {
       findById: async () => undefined,
       findByIdempotencyKey: async () => undefined,
       findByProviderTransaction: async () => undefined,
+      findByReferenceAndKind: async () => undefined,
       add: async (record) => {
         capture.wagerTransactions.push(record);
       },

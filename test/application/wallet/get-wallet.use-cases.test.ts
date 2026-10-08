@@ -81,6 +81,7 @@ function queryContext(options: {
       findById: async () => undefined,
       findByIdempotencyKey: async () => undefined,
       findByProviderTransaction: async () => undefined,
+      findByReferenceAndKind: async () => undefined,
       add: async () => undefined,
       save: async () => undefined,
     },

@@ -4,6 +4,7 @@ import type {
   WagerTransactionRecord,
   WagerTransactionRepository,
 } from '../../../application/ports/persistence/repositories.js';
+import type { WagerTransactionKind } from '../../../domain/wagering/wager-transaction.js';
 import { WagerTransactionPersistenceEntity } from '../entities/wager-transaction.persistence-entity.js';
 import { WagerTransactionPersistenceMapper } from '../mappers/wager-transaction.persistence-mapper.js';
 import { PersistenceRecordNotFoundError } from './persistence-record-not-found.error.js';
@@ -44,6 +45,20 @@ export class MikroOrmWagerTransactionRepository
     const entity = await this.entityManager.findOne(
       WagerTransactionPersistenceEntity,
       { providerId, externalTransactionId },
+    );
+
+    return entity === null
+      ? undefined
+      : WagerTransactionPersistenceMapper.toRecord(entity);
+  }
+
+  async findByReferenceAndKind(
+    referenceTransactionId: string,
+    kind: WagerTransactionKind,
+  ): Promise<WagerTransactionRecord | undefined> {
+    const entity = await this.entityManager.findOne(
+      WagerTransactionPersistenceEntity,
+      { referenceTransactionId, kind },
     );
 
     return entity === null
