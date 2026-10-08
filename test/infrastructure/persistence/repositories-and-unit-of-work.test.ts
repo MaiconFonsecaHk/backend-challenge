@@ -27,6 +27,7 @@ import { MikroOrmInboxMessageRepository } from '../../../src/infrastructure/pers
 import { MikroOrmOutboxMessageRepository } from '../../../src/infrastructure/persistence/repositories/mikro-orm-outbox-message.repository.js';
 import { MikroOrmWagerTransactionRepository } from '../../../src/infrastructure/persistence/repositories/mikro-orm-wager-transaction.repository.js';
 import { MikroOrmWalletLedgerEntryRepository } from '../../../src/infrastructure/persistence/repositories/mikro-orm-wallet-ledger-entry.repository.js';
+import { MikroOrmWalletReconciliationRepository } from '../../../src/infrastructure/persistence/repositories/mikro-orm-wallet-reconciliation.repository.js';
 import { MikroOrmWalletRepository } from '../../../src/infrastructure/persistence/repositories/mikro-orm-wallet.repository.js';
 import { PersistenceRecordNotFoundError } from '../../../src/infrastructure/persistence/repositories/persistence-record-not-found.error.js';
 
@@ -334,6 +335,83 @@ describe('MikroORM repositories', () => {
     });
   });
 
+  test('reconciles wallet and ledger from one exact aggregate query', async () => {
+    const executeCalls: Array<{
+      query: string;
+      params: readonly unknown[];
+      method: string;
+    }> = [];
+    const entityManager = {
+      async execute(
+        query: string,
+        params: readonly unknown[],
+        method: string,
+      ) {
+        executeCalls.push({ query, params, method });
+        return [
+          {
+            walletId: WALLET_ID,
+            storedBalance: '9007199254740993.12',
+            currency: 'BRL',
+            calculatedBalance: '9007199254740992.12',
+            checkedEntries: '7',
+          },
+        ];
+      },
+    } as unknown as EntityManager;
+    const repository = new MikroOrmWalletReconciliationRepository(
+      entityManager,
+    );
+
+    const snapshot = await repository.findByWalletId(WALLET_ID);
+
+    expect(snapshot?.storedBalance.toJSON().amount).toBe(
+      '9007199254740993.12',
+    );
+    expect(snapshot?.calculatedBalance.toJSON().amount).toBe(
+      '9007199254740992.12',
+    );
+    expect(snapshot?.checkedEntries).toBe(7);
+    expect(executeCalls).toHaveLength(1);
+    expect(executeCalls[0]?.params).toEqual([WALLET_ID]);
+    expect(executeCalls[0]?.method).toBe('all');
+    expect(executeCalls[0]?.query).toContain('left join wallet_ledger_entries');
+    expect(executeCalls[0]?.query).toContain('sum(');
+    expect(executeCalls[0]?.query).toContain('count(ledger.id)');
+  });
+
+  test('returns no reconciliation snapshot when the wallet does not exist', async () => {
+    const entityManager = {
+      execute: async () => [],
+    } as unknown as EntityManager;
+    const repository = new MikroOrmWalletReconciliationRepository(
+      entityManager,
+    );
+
+    expect(await repository.findByWalletId(WALLET_ID)).toBeUndefined();
+  });
+
+  test('rejects a ledger count that cannot be represented exactly', async () => {
+    const entityManager = {
+      execute: async () => [
+        {
+          walletId: WALLET_ID,
+          storedBalance: '10.00',
+          currency: 'BRL',
+          calculatedBalance: '10.00',
+          checkedEntries: '9007199254740993',
+        },
+      ],
+    } as unknown as EntityManager;
+    const repository = new MikroOrmWalletReconciliationRepository(
+      entityManager,
+    );
+
+    await expect(repository.findByWalletId(WALLET_ID)).rejects.toThrow(
+      'PostgreSQL returned an invalid ledger entry count',
+    );
+  });
+
   test('fails explicitly instead of silently inserting during save', async () => {
     const repository = new MikroOrmWalletRepository(
       entityManagerDouble(null).entityManager,
@@ -370,6 +448,9 @@ describe('MikroOrmUnitOfWork', () => {
     const result = await unitOfWork.execute(async (repositories) => {
       expect(Object.isFrozen(repositories)).toBe(true);
       expect(repositories.wallets).toBeInstanceOf(MikroOrmWalletRepository);
+      expect(repositories.walletReconciliations).toBeInstanceOf(
+        MikroOrmWalletReconciliationRepository,
+      );
       expect(repositories.wagerTransactions).toBeInstanceOf(
         MikroOrmWagerTransactionRepository,
       );

@@ -79,6 +79,9 @@ function persistenceDouble(existingWallet?: Wallet): {
       },
       save: async () => undefined,
     },
+    walletReconciliations: {
+      findByWalletId: async () => undefined,
+    },
     wagerTransactions: {
       findById: async () => undefined,
       findByIdempotencyKey: async () => undefined,

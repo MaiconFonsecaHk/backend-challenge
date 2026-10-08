@@ -15,6 +15,18 @@ export interface WalletRepository {
   save(wallet: Wallet): Promise<void>;
 }
 
+export interface WalletReconciliationSnapshot {
+  readonly storedBalance: Money;
+  readonly calculatedBalance: Money;
+  readonly checkedEntries: number;
+}
+
+export interface WalletReconciliationRepository {
+  findByWalletId(
+    walletId: string,
+  ): Promise<WalletReconciliationSnapshot | undefined>;
+}
+
 export interface WagerTransactionRepository {
   findById(id: string): Promise<WagerTransactionRecord | undefined>;
   findByIdempotencyKey(
@@ -74,6 +86,7 @@ export interface OutboxMessageRepository {
 
 export interface PersistenceRepositories {
   readonly wallets: WalletRepository;
+  readonly walletReconciliations: WalletReconciliationRepository;
   readonly wagerTransactions: WagerTransactionRepository;
   readonly walletLedgerEntries: WalletLedgerEntryRepository;
   readonly inboxMessages: InboxMessageRepository;

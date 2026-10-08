@@ -10,6 +10,7 @@ import { MikroOrmInboxMessageRepository } from './repositories/mikro-orm-inbox-m
 import { MikroOrmOutboxMessageRepository } from './repositories/mikro-orm-outbox-message.repository.js';
 import { MikroOrmWagerTransactionRepository } from './repositories/mikro-orm-wager-transaction.repository.js';
 import { MikroOrmWalletLedgerEntryRepository } from './repositories/mikro-orm-wallet-ledger-entry.repository.js';
+import { MikroOrmWalletReconciliationRepository } from './repositories/mikro-orm-wallet-reconciliation.repository.js';
 import { MikroOrmWalletRepository } from './repositories/mikro-orm-wallet.repository.js';
 
 @Injectable()
@@ -20,6 +21,9 @@ export class MikroOrmUnitOfWork implements UnitOfWork {
     return this.orm.em.transactional(async (entityManager) => {
       const repositories: PersistenceRepositories = Object.freeze({
         wallets: new MikroOrmWalletRepository(entityManager),
+        walletReconciliations: new MikroOrmWalletReconciliationRepository(
+          entityManager,
+        ),
         wagerTransactions: new MikroOrmWagerTransactionRepository(
           entityManager,
         ),

@@ -11,6 +11,7 @@ import { PERSISTENCE_UNIT_OF_WORK } from '../application/ports/persistence/unit-
 import { CreateWalletUseCase } from '../application/use-cases/wallet/create-wallet.use-case.js';
 import { GetWalletLedgerUseCase } from '../application/use-cases/wallet/get-wallet-ledger.use-case.js';
 import { GetWalletUseCase } from '../application/use-cases/wallet/get-wallet.use-case.js';
+import { ReconcileWalletUseCase } from '../application/use-cases/wallet/reconcile-wallet.use-case.js';
 import { UuidGenerator } from '../infrastructure/identity/uuid-generator.js';
 import { PersistenceModule } from '../infrastructure/persistence/persistence.module.js';
 import { Base64UrlLedgerCursorCodec } from '../infrastructure/serialization/base64url-ledger-cursor.codec.js';
@@ -45,7 +46,18 @@ import { SystemClock } from '../infrastructure/time/system-clock.js';
         cursorCodec: LedgerCursorCodec,
       ) => new GetWalletLedgerUseCase(unitOfWork, cursorCodec),
     },
+    {
+      provide: ReconcileWalletUseCase,
+      inject: [PERSISTENCE_UNIT_OF_WORK],
+      useFactory: (unitOfWork: UnitOfWork) =>
+        new ReconcileWalletUseCase(unitOfWork),
+    },
   ],
-  exports: [CreateWalletUseCase, GetWalletUseCase, GetWalletLedgerUseCase],
+  exports: [
+    CreateWalletUseCase,
+    GetWalletUseCase,
+    GetWalletLedgerUseCase,
+    ReconcileWalletUseCase,
+  ],
 })
 export class WalletApplicationModule {}

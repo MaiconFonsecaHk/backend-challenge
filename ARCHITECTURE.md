@@ -42,6 +42,7 @@ AppModule
 │   ├── CreateWalletUseCase
 │   ├── GetWalletUseCase
 │   ├── GetWalletLedgerUseCase
+│   ├── ReconcileWalletUseCase
 │   ├── Base64UrlLedgerCursorCodec
 │   ├── UuidGenerator
 │   └── SystemClock
@@ -51,7 +52,7 @@ AppModule
     └── SQS health indicator ── AWS SDK v3 ── MiniStack/SQS
 ```
 
-Ainda não existem endpoints financeiros, consumidor SQS ou workers. O domínio puro da Fase 2 contém `Money`, `Wallet`, `WagerTransaction`, `WalletLedgerEntry`, os modelos de inbox/outbox e os eventos de integração. A infraestrutura materializa os cinco modelos persistentes com constraints, índices, mappers, repositórios e Unit of Work transacional. A aplicação possui os casos de uso de criação e consulta de wallet e de consulta paginada do ledger; os demais casos de uso continuam nas etapas específicas do roadmap.
+Ainda não existem endpoints financeiros, consumidor SQS ou workers. O domínio puro da Fase 2 contém `Money`, `Wallet`, `WagerTransaction`, `WalletLedgerEntry`, os modelos de inbox/outbox e os eventos de integração. A infraestrutura materializa os cinco modelos persistentes com constraints, índices, mappers, repositórios e Unit of Work transacional. A aplicação possui os casos de uso de criação, consulta e reconciliação de wallet e de consulta paginada do ledger; os demais casos de uso continuam nas etapas específicas do roadmap.
 
 ## 4. Boundaries e dependências
 
@@ -251,7 +252,7 @@ O baseline permanece neutro e prova a cadeia inicial. A migration seguinte cont�
 - **Alternativas consideradas:** mocks ou banco em memória foram rejeitados porque não reproduzem `numeric`, SQLSTATE, constraints, triggers e transações do PostgreSQL; limpar o banco padrão foi rejeitado por risco de perda de dados e interferência entre execuções; schema temporário foi considerado, mas um banco dedicado representa melhor o ciclo de instalação desde zero e evita vazamento de `search_path`; Testcontainers foi adiado porque o Docker Compose obrigatório já fornece a infraestrutura e outra dependência não acrescentaria uma garantia nova nesta fase.
 - **Escolha:** `test:integration:postgres` conecta ao PostgreSQL do Compose, cria um banco com prefixo validado `backend_challenge_it_`, aplica a lista explícita de migrations e remove exclusivamente esse banco no `afterAll`, inclusive após falha. O nome aleatório permite execuções independentes e o descarte encerra conexões remanescentes antes do `DROP DATABASE`.
 - **Trade-off:** o teste exige PostgreSQL acessível e permissão `CREATEDB`, por isso permanece em script dedicado e é ignorado pela suíte unitária quando a flag explícita não está presente. Em troca, a prova é fiel ao driver e mantém `bun run test` rápido e utilizável sem infraestrutura.
-- **Evidência:** oito testes reais aplicam quatro migrations em banco limpo, persistem e reidratam os cinco modelos, exercitam a abertura completa de wallet, consultam wallet e ledger paginado, verificam constraints e imutabilidade, observam `BEGIN`, inserts, `ROLLBACK`, ausência dos efeitos revertidos, executam todos os `down`, confirmam zero tabelas da aplicação e reaplicam o schema completo. A consulta administrativa após a suíte confirma que nenhum banco temporário permanece.
+- **Evidência:** nove testes reais aplicam quatro migrations em banco limpo, persistem e reidratam os cinco modelos, exercitam a abertura completa de wallet, consultam wallet e ledger paginado, reconciliam wallet vazia e estados consistentes e divergentes, verificam constraints e imutabilidade, observam `BEGIN`, inserts, `ROLLBACK`, ausência dos efeitos revertidos, executam todos os `down`, confirmam zero tabelas da aplicação e reaplicam o schema completo. A consulta administrativa após a suíte confirma que nenhum banco temporário permanece.
 
 ### D-019 — Abertura de wallet é uma operação financeira atômica
 
@@ -262,7 +263,7 @@ O baseline permanece neutro e prova a cadeia inicial. A migration seguinte cont�
 - **IDs e tempo:** IDs internos são UUID v4 gerados na aplicação pela porta `IdGenerator`, usando `crypto.randomUUID()` sem nova dependência. Um único instante vindo da porta `Clock` alimenta wallet, transação, ledger e evento, evitando divergência dentro da operação. Chaves primárias e unicidades do PostgreSQL permanecem a defesa final contra colisões e duplicidade.
 - **Trade-off:** o pré-check permite erro de aplicação legível para duplicidade já existente, mas duas criações simultâneas ainda disputam a constraint única; a tradução dessa violação concorrente para conflito HTTP será fechada junto ao mapeamento de erros da API. UUID v4 não oferece localidade temporal, porém os cursores usam `(createdAt, id)` e não dependem de ID ordenável. O relógio da aplicação exige sincronização operacional entre instâncias; nenhuma invariante financeira depende da ordem física desses timestamps.
 - **Evidência:** testes unitários comprovam saldo positivo, saldo zero, identidade duplicada, correlação obrigatória e geração UUID v4. Em PostgreSQL real, o caso de uso persiste e reidrata wallet, `OPENING`, ledger e outbox, e uma consulta reconcilia saldo materializado com o ledger. Um segundo cenário deixa inserts chegarem ao banco, força falha no UUID da `OPENING`, observa `ROLLBACK` e confirma ausência de wallet e outbox.
-- **Limitação e gatilho de revisão:** ainda não existem controller HTTP, tradução da corrida de unicidade ou reconciliação operacional. As consultas existem na aplicação, mas só serão expostas publicamente quando os contratos e o mapeamento HTTP forem implementados.
+- **Limitação e gatilho de revisão:** ainda não existem controller HTTP ou tradução da corrida de unicidade. As operações de consulta e reconciliação existem na aplicação, mas só serão expostas publicamente quando os contratos e o mapeamento HTTP forem implementados.
 
 ### D-020 — Consultas retornam snapshots estáveis e o ledger usa cursor composto
 
@@ -273,6 +274,16 @@ O baseline permanece neutro e prova a cadeia inicial. A migration seguinte cont�
 - **Trade-off:** Base64URL impede que o contrato dependa de campos visíveis, mas não é criptografia nem assinatura. Alterações malformadas são rejeitadas, enquanto um cliente pode construir outro cursor estruturalmente válido; isso não concede escrita nem acesso a outra wallet porque `walletId` permanece parâmetro independente da consulta. O valor padrão é `50`; a aplicação exige inteiro positivo e o limite superior do transporte será definido com o contrato HTTP, sem inventar antecipadamente uma política operacional.
 - **Evidência:** testes unitários cobrem wallet existente e ausente, DTOs imutáveis, limite padrão, limites inválidos, `limit + 1`, página final, codec determinístico e rejeição de cursores malformados. O teste com PostgreSQL real cria entradas com o mesmo timestamp, confirma desempate por ID, insere uma entrada mais nova entre páginas e demonstra que a continuação pelo cursor não deriva nem repete resultados; uma consulta nova observa a inserção imediatamente.
 - **Limitação e gatilho de revisão:** validação de UUIDs de rota, limite máximo de página, serialização HTTP e política de status pertencem ao adapter HTTP. Assinatura do cursor só será adicionada se surgir requisito de integridade contra manipulação ou se o cursor passar a carregar informação sensível.
+
+### D-021 — Reconciliação usa um snapshot SQL e nunca corrige estado
+
+- **Status:** confirmada para o caso de uso e a leitura PostgreSQL; endpoint, log estruturado e métrica permanecem nas fases de API e observabilidade.
+- **Requisito protegido:** `wallet.balance` deve ser comparado ao saldo reconstruído pelo ledger imutável, divergências precisam ser explícitas e nenhuma reconciliação pode alterar silenciosamente wallet ou ledger.
+- **Alternativas consideradas:** carregar todas as entradas e somar na aplicação foi rejeitado por consumo de memória e transferência proporcionais ao histórico; ler a wallet e agregar o ledger em comandos separados foi rejeitado porque o isolamento padrão `READ COMMITTED` poderia usar snapshots diferentes durante um commit concorrente e produzir falso positivo; usar o último `balanceAfter` foi rejeitado porque dependeria da cadeia materializada em vez de reconstruir o saldo a partir de todos os movimentos; corrigir a wallet automaticamente foi rejeitado pelo requisito de auditabilidade.
+- **Escolha:** um repositório de leitura específico executa um único `SELECT` que parte da wallet, agrega créditos como valores positivos e débitos como negativos, contabiliza as entradas e preserva os decimais como strings. O caso de uso calcula `difference = storedBalance - calculatedBalance` com `Money`, sinaliza igualdade em `consistent` e retorna DTO profundamente imutável. Wallet sem ledger reconcilia contra zero; wallet inexistente gera `WALLET_NOT_FOUND`.
+- **Trade-off:** a agregação percorre todo o ledger da wallet e seu custo cresce com o histórico, mas fornece a prova integral exigida sem materialização adicional sujeita a drift. A contagem sai do PostgreSQL como inteiro decimal e só vira `number` após validação de representação segura, pois o contrato HTTP exige quantidade numérica; dinheiro nunca passa por essa conversão. A consulta é observacional e não abre caminho de escrita no repositório.
+- **Evidência:** testes unitários cobrem saldo consistente acima do limite seguro do JavaScript, diferença negativa, wallet vazia, ausência da wallet, DTOs congelados, SQL agregado único e rejeição de contagem inexata. No PostgreSQL real, quatro créditos produzem saldo calculado `40.00`; após uma alteração intencional do saldo materializado para `41.00`, a resposta informa diferença `1.00`, `consistent: false` e quatro entradas, nenhuma instrução de correção é emitida e a wallet permanece em `41.00`.
+- **Limitação e gatilho de revisão:** o endpoint ainda deverá registrar log estruturado e incrementar métrica quando `consistent` for falso. Essas integrações serão ligadas na borda sem conceder ao caso de uso capacidade de corrigir dados; volumes que tornem a agregação integral lenta exigirão medição antes de qualquer resumo materializado ou estratégia incremental.
 
 ## 6. Decisões abertas
 
@@ -328,11 +339,11 @@ bun run migration:up
 bun run migration:down
 ```
 
-O ciclo `up → inspeção → down → inspeção → up` agora é automatizado em um banco temporário criado por execução. A suíte PostgreSQL também comprova round-trip exato dos cinco modelos, commit, rollback após SQL efetivamente executado, constraints representativas, imutabilidade do ledger e paginação estável com empate de timestamp e inserção entre páginas. A inspeção inicial permanece como evidência ampliada de 22 violações e dos planos dos três índices com dados representativos. Os testes de concorrência financeira e de SQS serão adicionados nas fases correspondentes; a suíte atual também comprova o runner do Bun, a configuração, o comportamento puro do domínio e os contratos de persistência.
+O ciclo `up → inspeção → down → inspeção → up` agora é automatizado em um banco temporário criado por execução. A suíte PostgreSQL também comprova round-trip exato dos cinco modelos, commit, rollback após SQL efetivamente executado, constraints representativas, imutabilidade do ledger, paginação estável com empate de timestamp e inserção entre páginas e reconciliação sem correção silenciosa. A inspeção inicial permanece como evidência ampliada de 22 violações e dos planos dos três índices com dados representativos. Os testes de concorrência financeira e de SQS serão adicionados nas fases correspondentes; a suíte atual também comprova o runner do Bun, a configuração, o comportamento puro do domínio e os contratos de persistência.
 
 ## 10. Limitações atuais
 
-- criação e consultas de wallet e ledger possuem casos de uso; processamento de apostas e reconciliação ainda não foram implementados;
+- criação, consultas e reconciliação de wallet e ledger possuem casos de uso; processamento de apostas ainda não foi implementado;
 - não existem endpoints de wallet, wagering ou ledger;
 - não existem consumer, inbox, outbox ou publisher;
 - não existem garantias implementadas de concorrência ou idempotência;

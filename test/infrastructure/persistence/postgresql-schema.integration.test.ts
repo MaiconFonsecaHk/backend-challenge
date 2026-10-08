@@ -7,6 +7,7 @@ import type { IdGenerator } from '../../../src/application/ports/id-generator.js
 import { CreateWalletUseCase } from '../../../src/application/use-cases/wallet/create-wallet.use-case.js';
 import { GetWalletLedgerUseCase } from '../../../src/application/use-cases/wallet/get-wallet-ledger.use-case.js';
 import { GetWalletUseCase } from '../../../src/application/use-cases/wallet/get-wallet.use-case.js';
+import { ReconcileWalletUseCase } from '../../../src/application/use-cases/wallet/reconcile-wallet.use-case.js';
 import { databaseEnvironmentSchema } from '../../../src/config/environment.schema.js';
 import { LedgerDirection } from '../../../src/domain/ledger/ledger-direction.js';
 import { WalletLedgerEntry } from '../../../src/domain/ledger/wallet-ledger-entry.js';
@@ -472,7 +473,7 @@ describePostgreSql('PostgreSQL schema integration', () => {
     expect(reconciliation?.reconciled).toBe(true);
   });
 
-  test('queries wallets and paginates equal-timestamp ledger entries without drift', async () => {
+  test('queries wallets, paginates the ledger, and exposes divergence without correction', async () => {
     const walletId = '10000000-0000-4000-8000-000000000107';
     const playerId = '20000000-0000-4000-8000-000000000107';
     const unitOfWork = new MikroOrmUnitOfWork(requiredApplicationOrm());
@@ -581,6 +582,70 @@ describePostgreSql('PostgreSQL schema integration', () => {
       playerId,
       balance: { amount: '40.00', currency: 'BRL' },
       version: 5,
+    });
+
+    const reconciliationUseCase = new ReconcileWalletUseCase(unitOfWork);
+    expect(await reconciliationUseCase.execute(walletId)).toEqual({
+      walletId,
+      storedBalance: { amount: '40.00', currency: 'BRL' },
+      calculatedBalance: { amount: '40.00', currency: 'BRL' },
+      difference: { amount: '0.00', currency: 'BRL' },
+      consistent: true,
+      checkedEntries: 4,
+    });
+
+    await requiredApplicationOrm().em.execute(
+      `update wallets
+          set balance = '41.00', version = version + 1, updated_at = ?
+        where id = ?`,
+      [new Date('2026-10-08T13:02:00.000Z'), walletId],
+    );
+    queryLog.length = 0;
+
+    expect(await reconciliationUseCase.execute(walletId)).toEqual({
+      walletId,
+      storedBalance: { amount: '41.00', currency: 'BRL' },
+      calculatedBalance: { amount: '40.00', currency: 'BRL' },
+      difference: { amount: '1.00', currency: 'BRL' },
+      consistent: false,
+      checkedEntries: 4,
+    });
+    expect(
+      queryLog.some((message) => message.includes('update "wallets"')),
+    ).toBe(false);
+    expect(await new GetWalletUseCase(unitOfWork).execute(walletId)).toEqual({
+      id: walletId,
+      playerId,
+      balance: { amount: '41.00', currency: 'BRL' },
+      version: 6,
+    });
+  });
+
+  test('reconciles a persisted zero-balance wallet without ledger entries', async () => {
+    const walletId = '10000000-0000-4000-8000-000000000108';
+    const playerId = '20000000-0000-4000-8000-000000000108';
+    const unitOfWork = new MikroOrmUnitOfWork(requiredApplicationOrm());
+    const createWallet = new CreateWalletUseCase(
+      unitOfWork,
+      new SequenceIdGenerator([walletId]),
+      new FixedClock(CREATED_AT),
+    );
+
+    await createWallet.execute({
+      playerId,
+      initialBalance: { amount: '0.00', currency: 'BRL' },
+      correlationId: 'wallet-create-integration-108',
+    });
+
+    expect(
+      await new ReconcileWalletUseCase(unitOfWork).execute(walletId),
+    ).toEqual({
+      walletId,
+      storedBalance: { amount: '0.00', currency: 'BRL' },
+      calculatedBalance: { amount: '0.00', currency: 'BRL' },
+      difference: { amount: '0.00', currency: 'BRL' },
+      consistent: true,
+      checkedEntries: 0,
     });
   });
 
