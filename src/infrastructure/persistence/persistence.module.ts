@@ -3,7 +3,9 @@ import { PostgreSqlDriver } from '@mikro-orm/postgresql';
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 
+import { PERSISTENCE_UNIT_OF_WORK } from '../../application/ports/persistence/unit-of-work.js';
 import type { EnvironmentVariables } from '../../config/environment.schema.js';
+import { MikroOrmUnitOfWork } from './mikro-orm.unit-of-work.js';
 import { createMikroOrmOptions } from './mikro-orm.options.js';
 
 @Module({
@@ -17,5 +19,12 @@ import { createMikroOrmOptions } from './mikro-orm.options.js';
       ) => createMikroOrmOptions(config),
     }),
   ],
+  providers: [
+    {
+      provide: PERSISTENCE_UNIT_OF_WORK,
+      useClass: MikroOrmUnitOfWork,
+    },
+  ],
+  exports: [PERSISTENCE_UNIT_OF_WORK],
 })
 export class PersistenceModule {}

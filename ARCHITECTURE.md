@@ -35,6 +35,8 @@ AppModule
 ├── PersistenceModule
 │   └── MikroORM
 │       ├── registro explícito de modelos de persistência
+│       ├── repositórios transacionais e mappers explícitos
+│       ├── Unit of Work por `EntityManager.transactional()`
 │       └── PostgreSQL
 └── HealthModule
     ├── GET /health/live
@@ -42,7 +44,7 @@ AppModule
     └── SQS health indicator ── AWS SDK v3 ── MiniStack/SQS
 ```
 
-Ainda não existem endpoints financeiros, consumidor SQS ou workers. O domínio puro da Fase 2 contém `Money`, `Wallet`, `WagerTransaction`, `WalletLedgerEntry`, os modelos de inbox/outbox e os eventos de integração. A infraestrutura já descreve e materializa os cinco modelos persistentes com suas constraints obrigatórias e com três índices derivados de acessos demonstrados; repositórios e casos de uso continuam nas etapas específicas do roadmap.
+Ainda não existem endpoints financeiros, consumidor SQS ou workers. O domínio puro da Fase 2 contém `Money`, `Wallet`, `WagerTransaction`, `WalletLedgerEntry`, os modelos de inbox/outbox e os eventos de integração. A infraestrutura já descreve e materializa os cinco modelos persistentes com suas constraints obrigatórias, três índices derivados de acessos demonstrados, mappers, repositórios e um Unit of Work transacional; os casos de uso continuam nas etapas específicas do roadmap.
 
 ## 4. Boundaries e dependências
 
@@ -222,6 +224,19 @@ O baseline permanece neutro e prova a cadeia inicial. A migration seguinte cont�
 - **Evidência:** em PostgreSQL real, após `ANALYZE`, uma base com 5.000 lançamentos de ledger, 10.000 transações e 10.000 mensagens de outbox fez o planner escolher naturalmente os três índices, sem desabilitar sequential scan: `Index Scan Backward` no ledger e `Index Only Scan` nos dois workers. Testes de metadados verificam o conjunto exato e os predicados parciais. A migration removeu os três índices no `down`, restaurou-os no `up` e a comparação final não encontrou drift.
 - **Limitação e gatilho de revisão:** planos dependem de distribuição, cardinalidade, estatísticas e consultas reais. Os repositórios deverão preservar os predicados e a ordenação comprovados; métricas de produção ou novos padrões de acesso podem justificar revisão, remoção ou novos índices com nova evidência de `EXPLAIN (ANALYZE, BUFFERS)`.
 
+### D-017 — Repositórios são portas puras e o Unit of Work controla a transação
+
+- **Status:** confirmada para os contratos, mappers e adapters MikroORM; a prova de commit e rollback contra PostgreSQL real pertence ao próximo bloco de integração.
+- **Requisito protegido:** wallet, transação de aposta, ledger, inbox e outbox precisam compartilhar uma única transação SQL sem expor MikroORM ao domínio ou permitir que cada repositório confirme seus efeitos isoladamente.
+- **Alternativas consideradas:** injetar repositórios do MikroORM diretamente nos casos de uso foi rejeitado porque vazaria tipos e ciclo de vida do ORM para a aplicação; permitir `flush` ou `transactional()` em cada repositório foi rejeitado porque poderia confirmar efeitos parciais; um repositório genérico foi rejeitado porque esconderia identidades, consultas e regras diferentes, especialmente a natureza append-only do ledger; decorators nas entidades de domínio continuam rejeitados pela direção de dependência.
+- **Escolha para as portas:** a aplicação define contratos específicos para wallet, wager transaction, ledger, inbox e outbox. O ledger expõe somente leitura por identidade financeira e inclusão, sem `save` ou `delete`. O repositório de transações devolve um `WagerTransactionRecord` que conserva a entidade de domínio, o saldo original do resultado, tentativas de referência e próximo agendamento, evitando perder dados necessários para replay e recuperação.
+- **Escolha para os mappers:** cada modelo possui conversão explícita entre persistência e domínio. Valores `numeric` permanecem strings e são normalizados para duas casas antes de criar `Money`; valores maiores que o limite seguro do JavaScript não passam por `number`. Campos opcionais são convertidos conscientemente entre `null` do banco e `undefined` do domínio, e payloads de outbox voltam a passar pela cópia imutável do modelo.
+- **Escolha para o Unit of Work:** `MikroOrmUnitOfWork.execute()` abre `EntityManager.transactional()` e cria todos os repositórios com o mesmo `EntityManager` transacional. Os adapters apenas registram inclusões ou atribuem estado mutável; nenhum chama `flush`, inicia transação própria ou publica evento. O provider é exportado por token de aplicação, não pela classe concreta do ORM.
+- **Atualizações:** `add` é explícito e `save` exige que o registro já exista, falhando em vez de transformar silenciosamente uma atualização em inserção. Wallet, wager transaction, inbox e outbox atualizam somente seus campos mutáveis; identidade e payload imutáveis não são reassinados. Ledger permanece sem caminho de atualização ou exclusão.
+- **Trade-off:** todo caso de uso persistente precisa entrar pelo callback do Unit of Work e construir o registro operacional completo da transação de aposta. Essa disciplina acrescenta tipos e mappers, mas deixa o limite transacional visível e testável. Consultas de worker, locking, paginação do ledger e tradução de erros SQL continuam fora desses contratos até suas decisões próprias.
+- **Evidência:** testes unitários exercitam round-trip exato dos cinco modelos, inclusive decimal acima do limite seguro, saldo original e estado de referência; verificam as identidades de consulta, inclusão sem flush, atualização restrita a estado mutável, ausência de update no ledger, falha explícita de `save` inexistente, compartilhamento do mesmo `EntityManager` e propagação de erro pelo limite transacional. Type-check e build validam a composição do provider no NestJS.
+- **Limitação e gatilho de revisão:** doubles comprovam a direção das chamadas, mas não provam semântica real de commit, rollback, identity map, constraints ou round-trip do driver PostgreSQL. Essas garantias só serão fechadas pelos testes de integração do schema em banco real, item imediatamente seguinte do roadmap.
+
 ## 6. Decisões abertas
 
 Nenhuma alternativa desta tabela está escolhida antecipadamente.
@@ -247,7 +262,7 @@ Nenhuma alternativa desta tabela está escolhida antecipadamente.
 
 ## 7. Modelo transacional — estado atual
 
-O modelo transacional financeiro permanece aberto. As entidades financeiras, inbox, outbox e eventos já expressam seus estados locais, mas os casos de uso e as garantias de persistência ainda não foram implementados. A restrição estabelecida é:
+O Unit of Work e os repositórios já estabelecem o limite técnico de uma transação SQL compartilhada. Os casos de uso financeiros e as provas reais de commit, rollback e concorrência ainda não foram implementados. A restrição estabelecida é:
 
 ```text
 wallet + ledger + wager transaction + inbox + outbox
@@ -283,8 +298,8 @@ O ciclo `up → inspeção → down → inspeção → up` foi comprovado em ban
 
 ## 10. Limitações atuais
 
-- os modelos puros da Fase 2 ainda não possuem casos de uso, mappers nem repositórios;
-- tabelas, constraints obrigatórias e índices para os três acessos demonstrados existem, mas ainda faltam repositórios e testes automatizados de integração contra o schema real;
+- os modelos puros da Fase 2 ainda não possuem casos de uso;
+- tabelas, constraints, índices, mappers, repositórios e Unit of Work existem, mas ainda faltam testes automatizados de integração contra o schema real;
 - não existem endpoints de wallet, wagering ou ledger;
 - não existem consumer, inbox, outbox ou publisher;
 - não existem garantias implementadas de concorrência ou idempotência;
