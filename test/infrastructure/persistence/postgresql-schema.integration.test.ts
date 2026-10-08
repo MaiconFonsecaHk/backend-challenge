@@ -2,6 +2,9 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { Migrator } from '@mikro-orm/migrations';
 import { MikroORM } from '@mikro-orm/postgresql';
 
+import type { Clock } from '../../../src/application/ports/clock.js';
+import type { IdGenerator } from '../../../src/application/ports/id-generator.js';
+import { CreateWalletUseCase } from '../../../src/application/use-cases/wallet/create-wallet.use-case.js';
 import { databaseEnvironmentSchema } from '../../../src/config/environment.schema.js';
 import { LedgerDirection } from '../../../src/domain/ledger/ledger-direction.js';
 import { WalletLedgerEntry } from '../../../src/domain/ledger/wallet-ledger-entry.js';
@@ -11,6 +14,7 @@ import { Money } from '../../../src/domain/shared/value-objects/money.js';
 import {
   WagerTransaction,
   WagerTransactionKind,
+  WagerTransactionStatus,
 } from '../../../src/domain/wagering/wager-transaction.js';
 import { Wallet } from '../../../src/domain/wallet/wallet.js';
 import { PERSISTENCE_ENTITIES } from '../../../src/infrastructure/persistence/entities/persistence-entities.js';
@@ -47,6 +51,30 @@ interface PostgreSqlErrorDetails {
 
 interface TableNameRow {
   readonly table_name: string;
+}
+
+class FixedClock implements Clock {
+  constructor(private readonly instant: Date) {}
+
+  now(): Date {
+    return new Date(this.instant.getTime());
+  }
+}
+
+class SequenceIdGenerator implements IdGenerator {
+  private index = 0;
+
+  constructor(private readonly values: readonly string[]) {}
+
+  generate(): string {
+    const value = this.values[this.index];
+    if (value === undefined) {
+      throw new Error('Integration id sequence exhausted');
+    }
+
+    this.index += 1;
+    return value;
+  }
 }
 
 let administrationOrm: MikroORM | undefined;
@@ -361,6 +389,120 @@ describePostgreSql('PostgreSQL schema integration', () => {
         });
       },
     );
+  });
+
+  test('creates a wallet with atomic opening, ledger, and outbox records', async () => {
+    const walletId = '10000000-0000-4000-8000-000000000105';
+    const playerId = '20000000-0000-4000-8000-000000000105';
+    const openingId = '30000000-0000-4000-8000-000000000105';
+    const ledgerId = '40000000-0000-4000-8000-000000000105';
+    const eventId = '50000000-0000-4000-8000-000000000105';
+    const unitOfWork = new MikroOrmUnitOfWork(requiredApplicationOrm());
+    const useCase = new CreateWalletUseCase(
+      unitOfWork,
+      new SequenceIdGenerator([walletId, openingId, ledgerId, eventId]),
+      new FixedClock(CREATED_AT),
+    );
+
+    const result = await useCase.execute({
+      playerId,
+      initialBalance: { amount: '250.00', currency: 'BRL' },
+      correlationId: 'wallet-create-integration-105',
+    });
+
+    expect(result).toEqual({
+      id: walletId,
+      playerId,
+      balance: { amount: '250.00', currency: 'BRL' },
+      version: 1,
+    });
+
+    await unitOfWork.execute(async (repositories) => {
+      const wallet = await repositories.wallets.findById(walletId);
+      const opening = await repositories.wagerTransactions.findById(openingId);
+      const ledger =
+        await repositories.walletLedgerEntries.findByWalletAndTransaction(
+          walletId,
+          openingId,
+        );
+      const outbox = await repositories.outboxMessages.findById(eventId);
+
+      expect(wallet?.balance.toJSON()).toEqual({
+        amount: '250.00',
+        currency: 'BRL',
+      });
+      expect(opening?.transaction.kind).toBe(WagerTransactionKind.Opening);
+      expect(opening?.transaction.status).toBe(WagerTransactionStatus.Processed);
+      expect(opening?.resultBalance?.toJSON()).toEqual({
+        amount: '250.00',
+        currency: 'BRL',
+      });
+      expect(ledger?.direction).toBe(LedgerDirection.Credit);
+      expect(ledger?.balanceBefore.toJSON().amount).toBe('0.00');
+      expect(ledger?.balanceAfter.toJSON().amount).toBe('250.00');
+      expect(outbox?.eventType).toBe('WalletBalanceChanged');
+      expect(outbox?.payload).toEqual(
+        expect.objectContaining({
+          aggregateId: walletId,
+          causationId: openingId,
+          correlationId: 'wallet-create-integration-105',
+          eventId,
+        }),
+      );
+    });
+
+    const [reconciliation] = await requiredApplicationOrm().em
+      .getConnection()
+      .execute<Array<{ reconciled: boolean }>>(
+        `select wallet.balance = coalesce(sum(
+           case ledger.direction
+             when 'CREDIT' then ledger.amount
+             when 'DEBIT' then -ledger.amount
+           end
+         ), 0) as reconciled
+           from wallets wallet
+           left join wallet_ledger_entries ledger on ledger.wallet_id = wallet.id
+          where wallet.id = ?
+          group by wallet.id, wallet.balance`,
+        [walletId],
+      );
+    expect(reconciliation?.reconciled).toBe(true);
+  });
+
+  test('rolls back every wallet-opening effect when its transaction cannot persist', async () => {
+    const walletId = '10000000-0000-4000-8000-000000000106';
+    const playerId = '20000000-0000-4000-8000-000000000106';
+    const ledgerId = '40000000-0000-4000-8000-000000000106';
+    const eventId = '50000000-0000-4000-8000-000000000106';
+    const unitOfWork = new MikroOrmUnitOfWork(requiredApplicationOrm());
+    const useCase = new CreateWalletUseCase(
+      unitOfWork,
+      new SequenceIdGenerator([walletId, 'invalid-opening-id', ledgerId, eventId]),
+      new FixedClock(CREATED_AT),
+    );
+    queryLog.length = 0;
+
+    let caught: unknown;
+    try {
+      await useCase.execute({
+        playerId,
+        initialBalance: { amount: '50.00', currency: 'BRL' },
+        correlationId: 'wallet-create-integration-106',
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(postgresErrorDetails(caught).code).toBe('22P02');
+    expect(
+      queryLog.some((message) => message.includes('insert into "wallets"')),
+    ).toBe(true);
+    expect(queryLog.some((message) => message.includes('rollback'))).toBe(true);
+
+    await unitOfWork.execute(async (repositories) => {
+      expect(await repositories.wallets.findById(walletId)).toBeUndefined();
+      expect(await repositories.outboxMessages.findById(eventId)).toBeUndefined();
+    });
   });
 
   test('rejects critical uniqueness, nonnegative and immutability violations', async () => {
