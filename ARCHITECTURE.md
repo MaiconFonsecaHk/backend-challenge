@@ -40,7 +40,7 @@ AppModule
     └── SQS health indicator ── AWS SDK v3 ── MiniStack/SQS
 ```
 
-Ainda não existem endpoints financeiros, entidades persistentes, consumidor SQS, inbox, outbox ou workers. O domínio puro implementado até aqui contém `Money` e o aggregate `Wallet`; os demais elementos serão adicionados nas fases específicas do roadmap.
+Ainda não existem endpoints financeiros, entidades persistentes, consumidor SQS, inbox, outbox ou workers. O domínio puro implementado até aqui contém `Money`, o aggregate `Wallet` e `WagerTransaction`; os demais elementos serão adicionados nas fases específicas do roadmap.
 
 ## 4. Boundaries e dependências
 
@@ -149,6 +149,18 @@ O baseline atual não cria tabelas de domínio. Sua função é provar a cadeia 
 - **Evidência:** testes unitários cobrem abertura, saldo zero, identidade, saldo inicial negativo, crédito, débito até zero, overdraft sem mutação, moedas divergentes, movimentos não positivos, versionamento, timestamps defensivos, reidratação e códigos de erro estáveis.
 - **Limitação e gatilho de revisão:** a unicidade de `(playerId, currency)`, a atomicidade com `OPENING` e ledger, o controle de concorrência e a não-negatividade no schema só estarão garantidos após migrations e testes reais de PostgreSQL.
 
+### D-011 — Máquina de estados explícita para `WagerTransaction`
+
+- **Status:** confirmada para o domínio puro; resolução concorrente, unicidade de reversão e taxonomia concreta de falhas continuam abertas.
+- **Requisito protegido:** transações nascem em `PENDING`, referências ausentes permanecem recuperáveis e estados `PROCESSED`, `REJECTED` e `FAILED` nunca sofrem novas transições.
+- **Alternativas consideradas:** setters livres de status foram rejeitados porque permitiriam estados impossíveis; revalidar regras de transição durante `rehydrate` foi rejeitado porque reidratação deve reconstruir o estado persistido; definir agora todos os códigos de rejeição foi rejeitado porque essa taxonomia depende dos casos de uso e contratos ainda não implementados.
+- **Trade-off:** `FailureCode` permanece textual, mas só aceita identificadores estáveis em maiúsculas, números e underscores. Isso garante formato legível por máquina sem antecipar quais códigos pertencem a rejeições de negócio ou falhas permanentes.
+- **Escolha:** as transições válidas são `PENDING → PENDING_REFERENCE | PROCESSED | REJECTED | FAILED` e `PENDING_REFERENCE → PROCESSED | REJECTED | FAILED`; repetir `PENDING_REFERENCE` é erro de estado. `REFUND` e `ROLLBACK` exigem referência, `WIN` pode referenciar `BET`, e `OPENING`, `BET` e `LOSS` não carregam referência externa. Toda transição terminal registra timestamp; rejeição e falha também registram `failureCode`.
+- **Referências:** o cálculo da direção do ledger valida que a referência está `PROCESSED`, possui tipo permitido e pertence ao mesmo provider, player, wallet, moeda e rodada. `REFUND` e `ROLLBACK` exigem valor idêntico; `ROLLBACK` inverte a direção de `BET`, `WIN` ou `REFUND`. `LOSS` não possui direção de ledger.
+- **Semântica auxiliar:** `affectsBalance()` descreve o efeito do tipo da operação, não confirma que o efeito foi aplicado; uma transação rejeitada continua sem alterar wallet ou ledger. `matchesPayload()` apenas compara o hash persistido; canonicalização e algoritmo do hash continuam decisões abertas.
+- **Evidência:** testes unitários cobrem os seis tipos, identidade, valores positivos, formato de referência, todas as transições, terminalidade, timestamps defensivos, códigos de falha, reidratação, hash, efeito no saldo, direção do ledger e todas as regras locais de referência.
+- **Limitação e gatilho de revisão:** `OPENING` só será bloqueado em entradas HTTP/SQS quando esses adaptadores existirem. Uma única reversão por tipo, referência pendente, resolução atômica e proteção contra corridas exigem constraints, consultas e transações PostgreSQL nas fases seguintes.
+
 ## 6. Decisões abertas
 
 Nenhuma alternativa desta tabela está escolhida antecipadamente.
@@ -174,7 +186,7 @@ Nenhuma alternativa desta tabela está escolhida antecipadamente.
 
 ## 7. Modelo transacional — estado atual
 
-O modelo transacional financeiro permanece aberto. `Wallet` já expressa mudanças locais de saldo, mas os casos de uso, o ledger e as garantias de persistência ainda não foram implementados. A restrição estabelecida é:
+O modelo transacional financeiro permanece aberto. `Wallet` já expressa mudanças locais de saldo e `WagerTransaction` expressa estados e referências, mas os casos de uso, o ledger e as garantias de persistência ainda não foram implementados. A restrição estabelecida é:
 
 ```text
 wallet + ledger + wager transaction + inbox + outbox
@@ -206,11 +218,11 @@ bun run migration:up
 bun run migration:down
 ```
 
-O ciclo de migration deve ser comprovado em banco descartável antes de alterações reais de schema. Testes de integração e concorrência serão adicionados nas fases correspondentes; os testes atuais comprovam o runner do Bun, a normalização básica da configuração e o comportamento puro de `Money` e `Wallet`.
+O ciclo de migration deve ser comprovado em banco descartável antes de alterações reais de schema. Testes de integração e concorrência serão adicionados nas fases correspondentes; os testes atuais comprovam o runner do Bun, a normalização básica da configuração e o comportamento puro de `Money`, `Wallet` e `WagerTransaction`.
 
 ## 10. Limitações atuais
 
-- o modelo de domínio financeiro ainda está limitado a `Money` e `Wallet`;
+- o modelo de domínio financeiro ainda está limitado a `Money`, `Wallet` e `WagerTransaction`;
 - não existem tabelas de negócio ou constraints financeiras;
 - não existem endpoints de wallet, wagering ou ledger;
 - não existem consumer, inbox, outbox ou publisher;

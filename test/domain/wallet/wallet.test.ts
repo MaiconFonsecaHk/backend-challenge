@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 
+import { LedgerDirection } from '../../../src/domain/ledger/ledger-direction.js';
 import { CurrencyMismatchError } from '../../../src/domain/shared/errors/money.error.js';
 import { Money } from '../../../src/domain/shared/value-objects/money.js';
 import {
@@ -9,7 +10,7 @@ import {
   NegativeInitialBalanceError,
   NonPositiveWalletMovementError,
 } from '../../../src/domain/wallet/wallet.error.js';
-import { Wallet, WalletBalanceChangeDirection } from '../../../src/domain/wallet/wallet.js';
+import { Wallet } from '../../../src/domain/wallet/wallet.js';
 
 const OPENED_AT = new Date('2026-10-07T12:00:00.000Z');
 const MOVED_AT = new Date('2026-10-07T12:05:00.000Z');
@@ -88,7 +89,7 @@ describe('Wallet', () => {
     movedAt.setUTCFullYear(2030);
 
     expect(change).toEqual({
-      direction: WalletBalanceChangeDirection.Credit,
+      direction: LedgerDirection.Credit,
       money,
       balanceBefore: brl('100.00'),
       balanceAfter: brl('125.50'),
@@ -107,7 +108,7 @@ describe('Wallet', () => {
 
     const change = wallet.debit(money, MOVED_AT);
 
-    expect(change.direction).toBe(WalletBalanceChangeDirection.Debit);
+    expect(change.direction).toBe(LedgerDirection.Debit);
     expect(change.money).toBe(money);
     expect(change.balanceBefore.toJSON()).toEqual({ amount: '100.00', currency: 'BRL' });
     expect(change.balanceAfter.toJSON()).toEqual({ amount: '0.00', currency: 'BRL' });

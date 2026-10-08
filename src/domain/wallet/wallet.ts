@@ -1,5 +1,6 @@
 import { CurrencyMismatchError } from '../shared/errors/money.error.js';
 import { Money } from '../shared/value-objects/money.js';
+import { LedgerDirection } from '../ledger/ledger-direction.js';
 import {
   InsufficientFundsError,
   InvalidWalletIdentityError,
@@ -7,11 +8,6 @@ import {
   NegativeInitialBalanceError,
   NonPositiveWalletMovementError,
 } from './wallet.error.js';
-
-export enum WalletBalanceChangeDirection {
-  Debit = 'DEBIT',
-  Credit = 'CREDIT',
-}
 
 export interface OpenWalletProps {
   readonly id: string;
@@ -31,7 +27,7 @@ export interface WalletState {
 }
 
 export interface WalletBalanceChange {
-  readonly direction: WalletBalanceChangeDirection;
+  readonly direction: LedgerDirection;
   readonly money: Money;
   readonly balanceBefore: Money;
   readonly balanceAfter: Money;
@@ -114,7 +110,7 @@ export class Wallet {
     }
 
     return this.applyBalanceChange(
-      WalletBalanceChangeDirection.Debit,
+      LedgerDirection.Debit,
       money,
       balanceBefore,
       balanceAfter,
@@ -129,7 +125,7 @@ export class Wallet {
     const balanceAfter = balanceBefore.add(money);
 
     return this.applyBalanceChange(
-      WalletBalanceChangeDirection.Credit,
+      LedgerDirection.Credit,
       money,
       balanceBefore,
       balanceAfter,
@@ -169,7 +165,7 @@ export class Wallet {
   }
 
   private applyBalanceChange(
-    direction: WalletBalanceChangeDirection,
+    direction: LedgerDirection,
     money: Money,
     balanceBefore: Money,
     balanceAfter: Money,
