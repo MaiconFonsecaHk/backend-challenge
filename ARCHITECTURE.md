@@ -40,7 +40,7 @@ AppModule
     └── SQS health indicator ── AWS SDK v3 ── MiniStack/SQS
 ```
 
-Ainda não existem endpoints financeiros, entidades persistentes, consumidor SQS, inbox, outbox ou workers. O domínio puro implementado até aqui contém `Money`, o aggregate `Wallet` e `WagerTransaction`; os demais elementos serão adicionados nas fases específicas do roadmap.
+Ainda não existem endpoints financeiros, entidades persistentes, consumidor SQS, inbox, outbox ou workers. O domínio puro implementado até aqui contém `Money`, o aggregate `Wallet`, `WagerTransaction` e `WalletLedgerEntry`; os demais elementos serão adicionados nas fases específicas do roadmap.
 
 ## 4. Boundaries e dependências
 
@@ -161,6 +161,16 @@ O baseline atual não cria tabelas de domínio. Sua função é provar a cadeia 
 - **Evidência:** testes unitários cobrem os seis tipos, identidade, valores positivos, formato de referência, todas as transições, terminalidade, timestamps defensivos, códigos de falha, reidratação, hash, efeito no saldo, direção do ledger e todas as regras locais de referência.
 - **Limitação e gatilho de revisão:** `OPENING` só será bloqueado em entradas HTTP/SQS quando esses adaptadores existirem. Uma única reversão por tipo, referência pendente, resolução atômica e proteção contra corridas exigem constraints, consultas e transações PostgreSQL nas fases seguintes.
 
+### D-012 — Ledger imutável com aritmética verificável
+
+- **Status:** confirmada para a entidade de domínio; unicidade e imutabilidade no PostgreSQL continuam abertas.
+- **Requisito protegido:** cada lançamento precisa provar `balanceBefore ± money === balanceAfter`, usar uma única moeda e nunca representar saldo negativo.
+- **Alternativas consideradas:** confiar apenas no caso de uso foi rejeitado porque permitiria construir lançamentos inconsistentes; impedir a reidratação de dados divergentes foi rejeitado porque ocultaria corrupção que a reconciliação precisa detectar.
+- **Trade-off:** `create` valida todas as invariantes e falha imediatamente; `rehydrate` reconstrói exatamente o estado persistido, enquanto `isBalanced()` retorna `false` para aritmética, moeda, sinal ou direção inconsistentes. Assim, leitura e reconciliação conseguem tornar divergências visíveis sem normalizá-las silenciosamente.
+- **Escolha:** `WalletLedgerEntry` não possui setters nem métodos de transição, congela a instância e protege o timestamp com cópias defensivas. Débitos subtraem o valor do saldo anterior; créditos somam; o valor precisa ser positivo e os dois saldos precisam ser não negativos.
+- **Evidência:** testes unitários cobrem crédito, débito até zero, valores além do limite seguro do JavaScript, identidade, timestamp, moedas divergentes, valores não positivos, saldos negativos, aritmética incorreta, direção desconhecida, imutabilidade e reidratação de dados inconsistentes.
+- **Limitação e gatilho de revisão:** `Object.freeze` protege a instância em memória, mas não impede alterações no banco. A constraint única `(walletId, transactionId)`, as foreign keys e a proteção contra `UPDATE`/`DELETE` serão definidas e testadas na fase de persistência. A regra que impede ledger para `LOSS` ou transação rejeitada pertence ao caso de uso atômico.
+
 ## 6. Decisões abertas
 
 Nenhuma alternativa desta tabela está escolhida antecipadamente.
@@ -186,7 +196,7 @@ Nenhuma alternativa desta tabela está escolhida antecipadamente.
 
 ## 7. Modelo transacional — estado atual
 
-O modelo transacional financeiro permanece aberto. `Wallet` já expressa mudanças locais de saldo e `WagerTransaction` expressa estados e referências, mas os casos de uso, o ledger e as garantias de persistência ainda não foram implementados. A restrição estabelecida é:
+O modelo transacional financeiro permanece aberto. `Wallet` já expressa mudanças locais de saldo, `WagerTransaction` expressa estados e referências e `WalletLedgerEntry` valida a aritmética do lançamento, mas os casos de uso e as garantias de persistência ainda não foram implementados. A restrição estabelecida é:
 
 ```text
 wallet + ledger + wager transaction + inbox + outbox
@@ -218,11 +228,11 @@ bun run migration:up
 bun run migration:down
 ```
 
-O ciclo de migration deve ser comprovado em banco descartável antes de alterações reais de schema. Testes de integração e concorrência serão adicionados nas fases correspondentes; os testes atuais comprovam o runner do Bun, a normalização básica da configuração e o comportamento puro de `Money`, `Wallet` e `WagerTransaction`.
+O ciclo de migration deve ser comprovado em banco descartável antes de alterações reais de schema. Testes de integração e concorrência serão adicionados nas fases correspondentes; os testes atuais comprovam o runner do Bun, a normalização básica da configuração e o comportamento puro de `Money`, `Wallet`, `WagerTransaction` e `WalletLedgerEntry`.
 
 ## 10. Limitações atuais
 
-- o modelo de domínio financeiro ainda está limitado a `Money`, `Wallet` e `WagerTransaction`;
+- o modelo de domínio financeiro ainda está limitado a `Money`, `Wallet`, `WagerTransaction` e `WalletLedgerEntry`;
 - não existem tabelas de negócio ou constraints financeiras;
 - não existem endpoints de wallet, wagering ou ledger;
 - não existem consumer, inbox, outbox ou publisher;
