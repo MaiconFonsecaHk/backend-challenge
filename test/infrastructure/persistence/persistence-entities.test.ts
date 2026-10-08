@@ -35,7 +35,7 @@ afterAll(async () => {
 });
 
 function property(entityName: string, propertyName: string) {
-  const metadata = orm.getMetadata().getByClassName(entityName);
+  const metadata = entityMetadata(entityName);
   const mappedProperty = metadata.properties[propertyName];
 
   if (mappedProperty === undefined) {
@@ -43,6 +43,10 @@ function property(entityName: string, propertyName: string) {
   }
 
   return mappedProperty;
+}
+
+function entityMetadata(entityName: string) {
+  return orm.getMetadata().getByClassName(entityName);
 }
 
 describe('persistence entity registry', () => {
@@ -155,5 +159,72 @@ describe('messaging persistence', () => {
     expect(property(ENTITY_NAMES.outbox, 'attempts').runtimeType).toBe('number');
     expect(property(ENTITY_NAMES.outbox, 'nextAttemptAt').nullable).toBe(true);
     expect(property(ENTITY_NAMES.outbox, 'publishedAt').nullable).toBe(true);
+  });
+});
+
+describe('database-enforced invariants', () => {
+  test('declares every mandatory uniqueness rule in the persistence metadata', () => {
+    expect(
+      entityMetadata(ENTITY_NAMES.wallet).uniques.map((constraint) => constraint.name),
+    ).toContain('wallets_player_id_currency_unique');
+    expect(property(ENTITY_NAMES.wager, 'idempotencyKey').unique).toBe(
+      'wager_transactions_idempotency_key_unique',
+    );
+    expect(
+      entityMetadata(ENTITY_NAMES.wager).uniques.map((constraint) => constraint.name),
+    ).toEqual([
+      'wager_transactions_provider_external_unique',
+      'wager_transactions_reference_kind_unique',
+    ]);
+    expect(
+      entityMetadata(ENTITY_NAMES.ledger).uniques.map((constraint) => constraint.name),
+    ).toContain('wallet_ledger_entries_wallet_transaction_unique');
+    expect(entityMetadata(ENTITY_NAMES.inbox).primaryKeys).toEqual([
+      'consumerName',
+      'messageId',
+    ]);
+  });
+
+  test.each([
+    [ENTITY_NAMES.wallet, 'wallets_balance_nonnegative_check'],
+    [ENTITY_NAMES.wallet, 'wallets_balance_scale_check'],
+    [ENTITY_NAMES.wallet, 'wallets_currency_format_check'],
+    [ENTITY_NAMES.wager, 'wager_transactions_amount_scale_check'],
+    [ENTITY_NAMES.wager, 'wager_transactions_external_reference_check'],
+    [ENTITY_NAMES.wager, 'wager_transactions_terminal_timestamp_check'],
+    [ENTITY_NAMES.wager, 'wager_transactions_failure_code_check'],
+    [ENTITY_NAMES.ledger, 'wallet_ledger_entries_monetary_scale_check'],
+    [ENTITY_NAMES.ledger, 'wallet_ledger_entries_arithmetic_check'],
+    [ENTITY_NAMES.inbox, 'inbox_messages_identity_not_blank_check'],
+    [ENTITY_NAMES.outbox, 'outbox_messages_payload_object_check'],
+    [ENTITY_NAMES.outbox, 'outbox_messages_attempts_nonnegative_check'],
+  ] as const)('registers %s constraint %s', (entityName, constraintName) => {
+    expect(
+      entityMetadata(entityName).checks.map((constraint) => constraint.name),
+    ).toContain(constraintName);
+  });
+
+  test('registers triggers for wallet versioning, transaction context and ledger immutability', () => {
+    expect(
+      entityMetadata(ENTITY_NAMES.wallet).triggers.map((trigger) => ({
+        events: trigger.events,
+        name: trigger.name,
+      })),
+    ).toEqual([
+      {
+        events: ['update'],
+        name: 'wallets_protect_identity_and_version',
+      },
+    ]);
+
+    expect(
+      entityMetadata(ENTITY_NAMES.wager).triggers.map((trigger) => trigger.name),
+    ).toEqual(['wager_transactions_validate_context']);
+    expect(
+      entityMetadata(ENTITY_NAMES.ledger).triggers.map((trigger) => trigger.name),
+    ).toEqual([
+      'wallet_ledger_entries_validate_context',
+      'wallet_ledger_entries_immutable',
+    ]);
   });
 });

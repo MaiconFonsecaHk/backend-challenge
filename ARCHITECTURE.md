@@ -42,7 +42,7 @@ AppModule
     └── SQS health indicator ── AWS SDK v3 ── MiniStack/SQS
 ```
 
-Ainda não existem endpoints financeiros, tabelas de negócio, consumidor SQS ou workers. O domínio puro da Fase 2 contém `Money`, `Wallet`, `WagerTransaction`, `WalletLedgerEntry`, os modelos de inbox/outbox e os eventos de integração. A infraestrutura já descreve os cinco modelos persistentes correspondentes, mas migrations, constraints, repositórios e casos de uso continuam nas etapas específicas do roadmap.
+Ainda não existem endpoints financeiros, consumidor SQS ou workers. O domínio puro da Fase 2 contém `Money`, `Wallet`, `WagerTransaction`, `WalletLedgerEntry`, os modelos de inbox/outbox e os eventos de integração. A infraestrutura já descreve e materializa os cinco modelos persistentes com suas constraints obrigatórias; índices de consulta, repositórios e casos de uso continuam nas etapas específicas do roadmap.
 
 ## 4. Boundaries e dependências
 
@@ -105,7 +105,7 @@ O domínio não pode importar NestJS, MikroORM, AWS SDK ou tipos de transporte. 
 - **Escolha:** a migration de schema foi gerada pela CLI do MikroORM a partir do registro explícito de entidades. Ela cria `wallets`, `wager_transactions`, `wallet_ledger_entries`, `inbox_messages` e `outbox_messages`, incluindo chaves primárias, relações já modeladas e os valores enumerados conhecidos. O `down` remove somente esse schema, preservando o baseline e o controle de migrations.
 - **Evidência:** em um banco PostgreSQL temporário e isolado, `migration:up` aplicou baseline e schema desde zero; a inspeção do catálogo confirmou exatamente as cinco tabelas; `migration:down` removeu todas elas; uma nova execução de `migration:up` as recriou; a comparação final entre banco, snapshot e metadados informou que não havia drift.
 
-O baseline permanece neutro e prova a cadeia inicial. A migration seguinte contém o DDL real das tabelas. Constraints financeiras adicionais, índices e proteção de imutabilidade do ledger continuam em blocos próprios e não são considerados concluídos pela simples criação das tabelas.
+O baseline permanece neutro e prova a cadeia inicial. A migration seguinte contém o DDL real das tabelas, e uma migration incremental aplica as constraints financeiras e a proteção de imutabilidade. Índices puramente orientados aos padrões de consulta continuam em bloco próprio; os índices criados por unicidades existem para garantir invariantes, não como otimização antecipada.
 
 ### D-006 — Liveness separado de readiness
 
@@ -150,7 +150,7 @@ O baseline permanece neutro e prova a cadeia inicial. A migration seguinte cont�
 - **Trade-off:** `credit` e `debit` alteram o estado local e retornam um `WalletBalanceChange` imutável com direção, valor, saldos anterior/posterior e nova versão. O retorno torna a mudança explícita, mas a garantia atômica de persistir wallet e ledger ainda pertence ao caso de uso e ao PostgreSQL.
 - **Escolha:** abertura aceita saldo zero ou positivo, inicia a versão em `1` e recebe o instante externamente; créditos e débitos exigem valores positivos da mesma moeda; overdraft falha antes de qualquer mutação; `rehydrate` reconstrói o estado persistido sem repetir validações de transição; cópias defensivas impedem mutação externa dos timestamps.
 - **Evidência:** testes unitários cobrem abertura, saldo zero, identidade, saldo inicial negativo, crédito, débito até zero, overdraft sem mutação, moedas divergentes, movimentos não positivos, versionamento, timestamps defensivos, reidratação e códigos de erro estáveis.
-- **Limitação e gatilho de revisão:** a unicidade de `(playerId, currency)`, a atomicidade com `OPENING` e ledger, o controle de concorrência e a não-negatividade no schema só estarão garantidos após migrations e testes reais de PostgreSQL.
+- **Limitação e gatilho de revisão:** unicidade de `(playerId, currency)`, não-negatividade, identidade imutável e progressão da versão já são protegidas no PostgreSQL. A atomicidade com `OPENING` e ledger e o controle de concorrência continuam dependentes dos casos de uso e dos testes paralelos.
 
 ### D-011 — Máquina de estados explícita para `WagerTransaction`
 
@@ -162,7 +162,7 @@ O baseline permanece neutro e prova a cadeia inicial. A migration seguinte cont�
 - **Referências:** o cálculo da direção do ledger valida que a referência está `PROCESSED`, possui tipo permitido e pertence ao mesmo provider, player, wallet, moeda e rodada. `REFUND` e `ROLLBACK` exigem valor idêntico; `ROLLBACK` inverte a direção de `BET`, `WIN` ou `REFUND`. `LOSS` não possui direção de ledger.
 - **Semântica auxiliar:** `affectsBalance()` descreve o efeito do tipo da operação, não confirma que o efeito foi aplicado; uma transação rejeitada continua sem alterar wallet ou ledger. `matchesPayload()` apenas compara o hash persistido; canonicalização e algoritmo do hash continuam decisões abertas.
 - **Evidência:** testes unitários cobrem os seis tipos, identidade, valores positivos, formato de referência, todas as transições, terminalidade, timestamps defensivos, códigos de falha, reidratação, hash, efeito no saldo, direção do ledger e todas as regras locais de referência.
-- **Limitação e gatilho de revisão:** `OPENING` só será bloqueado em entradas HTTP/SQS quando esses adaptadores existirem. Uma única reversão por tipo, referência pendente, resolução atômica e proteção contra corridas exigem constraints, consultas e transações PostgreSQL nas fases seguintes.
+- **Limitação e gatilho de revisão:** `OPENING` só será bloqueado em entradas HTTP/SQS quando esses adaptadores existirem. O PostgreSQL já limita uma reversão por tipo e valida o contexto de referências resolvidas; resolução atômica de referências pendentes e proteção contra corridas continuam dependentes das consultas, casos de uso e estratégia transacional.
 
 ### D-012 — Ledger imutável com aritmética verificável
 
@@ -172,7 +172,7 @@ O baseline permanece neutro e prova a cadeia inicial. A migration seguinte cont�
 - **Trade-off:** `create` valida todas as invariantes e falha imediatamente; `rehydrate` reconstrói exatamente o estado persistido, enquanto `isBalanced()` retorna `false` para aritmética, moeda, sinal ou direção inconsistentes. Assim, leitura e reconciliação conseguem tornar divergências visíveis sem normalizá-las silenciosamente.
 - **Escolha:** `WalletLedgerEntry` não possui setters nem métodos de transição, congela a instância e protege o timestamp com cópias defensivas. Débitos subtraem o valor do saldo anterior; créditos somam; o valor precisa ser positivo e os dois saldos precisam ser não negativos.
 - **Evidência:** testes unitários cobrem crédito, débito até zero, valores além do limite seguro do JavaScript, identidade, timestamp, moedas divergentes, valores não positivos, saldos negativos, aritmética incorreta, direção desconhecida, imutabilidade e reidratação de dados inconsistentes.
-- **Limitação e gatilho de revisão:** `Object.freeze` protege a instância em memória, mas não impede alterações no banco. A constraint única `(walletId, transactionId)`, as foreign keys e a proteção contra `UPDATE`/`DELETE` serão definidas e testadas na fase de persistência. A regra que impede ledger para `LOSS` ou transação rejeitada pertence ao caso de uso atômico.
+- **Limitação e gatilho de revisão:** a constraint única `(walletId, transactionId)`, as foreign keys e triggers agora impedem ledger duplicado, contexto incompatível, ledger para `LOSS` ou transação não processada e qualquer `UPDATE`/`DELETE`. A atomicidade entre alteração da wallet, transação e criação do ledger ainda pertence ao caso de uso e ao Unit of Work.
 
 ### D-013 — Inbox, outbox e eventos permanecem puros e orientados à persistência
 
@@ -188,15 +188,27 @@ O baseline permanece neutro e prova a cadeia inicial. A migration seguinte cont�
 
 ### D-014 — Modelos do MikroORM separados do domínio e registrados explicitamente
 
-- **Status:** confirmada para o desenho e a descoberta dos metadados; DDL, constraints, índices e round-trip em PostgreSQL real continuam abertos.
+- **Status:** confirmada para desenho, descoberta, DDL e constraints; índices de consulta e round-trip automatizado em PostgreSQL real continuam abertos.
 - **Requisito protegido:** o domínio deve permanecer independente do ORM, dinheiro não pode passar por `number` e runtime, CLI e migrations precisam descobrir o mesmo conjunto de modelos.
 - **Alternativas consideradas:** decorators do MikroORM nas entidades de domínio foram rejeitados por inverter a direção de dependência; `autoLoadEntities` isolado foi rejeitado porque só descobre entidades registradas em módulos Nest e não configura a CLI; mapear `Money` como objeto opaco foi rejeitado porque esconderia valor e moeda do schema; enums nativos do PostgreSQL não foram escolhidos porque aumentam o custo de evolução e reversão sem benefício demonstrado neste momento.
 - **Escolha:** cinco classes de persistência definidas com `defineEntity` vivem em `infrastructure`: wallet, wager transaction, ledger, inbox e outbox. Um registro único e explícito alimenta tanto o bootstrap do NestJS quanto a configuração da CLI. Relações financeiras usam foreign keys mapeadas para IDs escalares, evitando que referências do ORM atravessem a futura fronteira dos repositórios.
-- **Dinheiro e tempo:** valores monetários usam `numeric` com conversão do MikroORM para `string`, nunca `number`; moedas ocupam `char(3)` separado; timestamps usam `timestamptz`. Precisão máxima e autoridade de timestamps não foram inventadas. A escala fixa, moedas válidas e coerência entre colunas serão protegidas pelas constraints do próximo bloco.
+- **Dinheiro e tempo:** valores monetários usam `numeric` com conversão do MikroORM para `string`, nunca `number`; moedas ocupam `char(3)` separado; timestamps usam `timestamptz`. Precisão máxima e autoridade de timestamps não foram inventadas. Constraints agora rejeitam frações além de duas casas sem arredondamento silencioso, códigos de moeda inválidos, valores e saldos incompatíveis.
 - **Estado recuperável:** a transação persiste o saldo original do resultado idempotente e o agendamento de referências pendentes; inbox usa identidade composta `(consumerName, messageId)`; outbox conserva o envelope em `jsonb`, tentativas e datas de agendamento/publicação.
 - **IDs:** chaves internas e `playerId` são armazenados como UUID, coerentes com os contratos do desafio; a decisão de onde e como gerar esses UUIDs continua aberta.
 - **Evidência:** testes inicializam a descoberta de metadados sem conexão de banco e verificam as cinco tabelas, tipos monetários em string, moedas, enums, relações, identidade da inbox e estado recuperável da outbox/transação. Type-check e build também validam o mesmo registro usado pela aplicação.
-- **Limitação e gatilho de revisão:** os metadados ainda não criam nem protegem tabelas por si só. A decisão só poderá ser promovida a garantia persistente depois de uma migration reversível e de testes contra PostgreSQL real, incluindo round-trip monetário e inspeção das constraints.
+- **Limitação e gatilho de revisão:** migrations e provas diretas contra PostgreSQL confirmam o DDL e as rejeições, mas o round-trip monetário por repositório e a suíte automatizada de integração do schema pertencem aos próximos blocos.
+
+### D-015 — Invariantes persistentes usam constraints antes de triggers
+
+- **Status:** confirmada para as invariantes expressas pelo schema atual; atomicidade dos casos de uso e concorrência permanecem abertas.
+- **Requisito protegido:** unicidade, não-negatividade, precisão monetária, coerência de estados, contexto financeiro e imutabilidade não podem depender apenas da aplicação.
+- **Alternativas consideradas:** validação somente no domínio foi rejeitada porque outros writers ou falhas de código poderiam gravar estado inválido; `numeric(p, 2)` foi rejeitado porque exigiria um limite máximo arbitrário e pode arredondar entradas; `CHECK` consultando outras linhas foi rejeitado porque o PostgreSQL não garante esse uso; triggers para todas as regras foram rejeitados por esconder lógica que `UNIQUE`, foreign key ou `CHECK` representam melhor.
+- **Escolha para regras locais:** unicidades protegem wallet por jogador/moeda, idempotency key, identidade externa do provider, uma reversão por tipo, um ledger por wallet/transação e inbox composta. Checks protegem valores positivos ou não negativos, no máximo duas casas sem arredondamento, moedas, aritmética do ledger, timestamps, referências, estados terminais, failure codes, payload de outbox e contadores.
+- **Escolha para regras relacionais:** foreign keys preservam wallet, transação, ledger e referência resolvida. Triggers são restritos a regras que dependem da operação ou de outra linha: identidade e versão da wallet, terminalidade e contexto da transação, validade da referência, contexto do ledger e rejeição de `UPDATE`/`DELETE` no ledger.
+- **Inbox e outbox:** inbox é identificada por `(consumerName, messageId)`. Outbox usa `aggregateId` polimórfico para eventos de wallet ou transação; uma foreign key única não representaria ambos os alvos com integridade real. A ligação será garantida pela mesma transação SQL e testada no Unit of Work, sem inventar uma referência falsa.
+- **Trade-off:** triggers oferecem defesa final para invariantes relacionais, mas aumentam a complexidade do schema e exigem que a aplicação traduza SQLSTATEs estáveis. Operações administrativas capazes de desabilitar triggers permanecem fora do papel da aplicação e deverão ser restringidas operacionalmente.
+- **Evidência:** PostgreSQL real aceitou um conjunto coerente de wallet, aposta processada, ledger, inbox e outbox; 22 tentativas inválidas foram rejeitadas pela constraint ou trigger nominal esperada. O catálogo confirmou 39 checks/unicidades nomeados e quatro triggers. O rollback removeu os objetos gerenciados, a reaplicação os restaurou e a comparação final não encontrou drift.
+- **Limitação e gatilho de revisão:** a igualdade agregada entre saldo materializado e soma do ledger não é uma constraint de uma única linha. Ela será garantida pelo limite transacional do caso de uso e comprovada por testes de rollback, concorrência e reconciliação. A automação desses testes contra PostgreSQL continua no item de integração do schema.
 
 ## 6. Decisões abertas
 
@@ -255,12 +267,12 @@ bun run migration:up
 bun run migration:down
 ```
 
-O ciclo `up → inspeção → down → inspeção → up` foi comprovado em banco PostgreSQL temporário, seguido por uma comparação sem drift entre banco, snapshot e metadados. Testes automatizados de integração e concorrência serão adicionados nas fases correspondentes; os testes atuais também comprovam o runner do Bun, a normalização básica da configuração, o comportamento puro da Fase 2 e a descoberta dos cinco modelos persistentes com seus tipos e relações.
+O ciclo `up → inspeção → down → inspeção → up` foi comprovado em banco PostgreSQL temporário, seguido por uma comparação sem drift entre banco, snapshot e metadados. As constraints também foram exercitadas diretamente com um fixture válido e 22 violações intencionais. A automação de integração e os testes de concorrência serão adicionados nas fases correspondentes; os testes atuais também comprovam o runner do Bun, a normalização básica da configuração, o comportamento puro da Fase 2 e a descoberta dos modelos persistentes.
 
 ## 10. Limitações atuais
 
 - os modelos puros da Fase 2 ainda não possuem casos de uso, mappers nem repositórios;
-- a migration materializa as cinco tabelas, mas ainda faltam constraints financeiras obrigatórias, índices orientados aos acessos e proteção de imutabilidade do ledger;
+- tabelas e constraints obrigatórias existem, mas ainda faltam índices orientados aos acessos demonstrados;
 - não existem endpoints de wallet, wagering ou ledger;
 - não existem consumer, inbox, outbox ou publisher;
 - não existem garantias implementadas de concorrência ou idempotência;

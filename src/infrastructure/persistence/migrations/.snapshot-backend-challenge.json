@@ -107,7 +107,18 @@
           "unique": true
         }
       ],
-      "checks": [],
+      "checks": [
+        {
+          "name": "inbox_messages_identity_not_blank_check",
+          "expression": "length(btrim(consumer_name)) > 0 and length(btrim(message_id)) > 0 and length(btrim(payload_hash)) > 0",
+          "definition": "check (length(btrim(consumer_name)) > 0 and length(btrim(message_id)) > 0 and length(btrim(payload_hash)) > 0)"
+        },
+        {
+          "name": "inbox_messages_timestamp_order_check",
+          "expression": "processed_at is null or processed_at >= received_at",
+          "definition": "check (processed_at is null or processed_at >= received_at)"
+        }
+      ],
       "triggers": [],
       "foreignKeys": {},
       "comment": null
@@ -265,7 +276,33 @@
           "unique": true
         }
       ],
-      "checks": [],
+      "checks": [
+        {
+          "name": "outbox_messages_attempts_nonnegative_check",
+          "expression": "attempts >= 0",
+          "definition": "check (attempts >= 0)"
+        },
+        {
+          "name": "outbox_messages_event_type_not_blank_check",
+          "expression": "length(btrim(event_type)) > 0",
+          "definition": "check (length(btrim(event_type)) > 0)"
+        },
+        {
+          "name": "outbox_messages_payload_object_check",
+          "expression": "jsonb_typeof(payload) = 'object'",
+          "definition": "check (jsonb_typeof(payload) = 'object')"
+        },
+        {
+          "name": "outbox_messages_publication_state_check",
+          "expression": "published_at is null or next_attempt_at is null",
+          "definition": "check (published_at is null or next_attempt_at is null)"
+        },
+        {
+          "name": "outbox_messages_timestamp_order_check",
+          "expression": "(next_attempt_at is null or next_attempt_at >= occurred_at) and (published_at is null or published_at >= occurred_at)",
+          "definition": "check ((next_attempt_at is null or next_attempt_at >= occurred_at) and (published_at is null or published_at >= occurred_at))"
+        }
+      ],
       "triggers": [],
       "foreignKeys": {},
       "comment": null
@@ -400,7 +437,7 @@
           "autoincrement": false,
           "primary": false,
           "nullable": false,
-          "unique": false,
+          "unique": true,
           "length": null,
           "precision": null,
           "scale": null,
@@ -509,7 +546,7 @@
           "autoincrement": false,
           "primary": false,
           "nullable": false,
-          "unique": false,
+          "unique": true,
           "length": null,
           "precision": null,
           "scale": null,
@@ -560,7 +597,7 @@
           "autoincrement": false,
           "primary": false,
           "nullable": true,
-          "unique": false,
+          "unique": true,
           "length": null,
           "precision": null,
           "scale": null,
@@ -665,6 +702,16 @@
       "indexes": [
         {
           "columnNames": [
+            "idempotency_key"
+          ],
+          "composite": false,
+          "constraint": true,
+          "keyName": "wager_transactions_idempotency_key_unique",
+          "primary": false,
+          "unique": true
+        },
+        {
+          "columnNames": [
             "id"
           ],
           "composite": false,
@@ -672,9 +719,62 @@
           "keyName": "wager_transactions_pkey",
           "primary": true,
           "unique": true
+        },
+        {
+          "columnNames": [
+            "provider_id",
+            "external_transaction_id"
+          ],
+          "composite": true,
+          "constraint": true,
+          "keyName": "wager_transactions_provider_external_unique",
+          "primary": false,
+          "unique": true
+        },
+        {
+          "columnNames": [
+            "reference_transaction_id",
+            "kind"
+          ],
+          "composite": true,
+          "constraint": false,
+          "keyName": "wager_transactions_reference_kind_unique",
+          "primary": false,
+          "unique": true,
+          "where": "kind in ('REFUND', 'ROLLBACK') and reference_transaction_id is not null"
         }
       ],
       "checks": [
+        {
+          "name": "wager_transactions_amount_positive_check",
+          "expression": "amount > 0",
+          "definition": "check (amount > 0)"
+        },
+        {
+          "name": "wager_transactions_amount_scale_check",
+          "expression": "amount = trunc(amount, 2)",
+          "definition": "check (amount = trunc(amount, 2))"
+        },
+        {
+          "name": "wager_transactions_currency_format_check",
+          "expression": "currency ~ '^[A-Z]{3}$'",
+          "definition": "check (currency ~ '^[A-Z]{3}$')"
+        },
+        {
+          "name": "wager_transactions_external_reference_check",
+          "expression": "(kind in ('REFUND', 'ROLLBACK') and reference_external_transaction_id is not null) or (kind in ('OPENING', 'BET', 'LOSS') and reference_external_transaction_id is null) or kind = 'WIN'",
+          "definition": "check ((kind in ('REFUND', 'ROLLBACK') and reference_external_transaction_id is not null) or (kind in ('OPENING', 'BET', 'LOSS') and reference_external_transaction_id is null) or kind = 'WIN')"
+        },
+        {
+          "name": "wager_transactions_failure_code_check",
+          "expression": "(status in ('REJECTED', 'FAILED') and failure_code is not null and failure_code ~ '^[A-Z][A-Z0-9]*(_[A-Z0-9]+)*$') or (status not in ('REJECTED', 'FAILED') and failure_code is null)",
+          "definition": "check ((status in ('REJECTED', 'FAILED') and failure_code is not null and failure_code ~ '^[A-Z][A-Z0-9]*(_[A-Z0-9]+)*$') or (status not in ('REJECTED', 'FAILED') and failure_code is null))"
+        },
+        {
+          "name": "wager_transactions_identity_not_blank_check",
+          "expression": "length(btrim(provider_id)) > 0 and length(btrim(external_transaction_id)) > 0 and length(btrim(idempotency_key)) > 0 and length(btrim(payload_hash)) > 0 and length(btrim(round_id)) > 0 and length(btrim(game_id)) > 0",
+          "definition": "check (length(btrim(provider_id)) > 0 and length(btrim(external_transaction_id)) > 0 and length(btrim(idempotency_key)) > 0 and length(btrim(payload_hash)) > 0 and length(btrim(round_id)) > 0 and length(btrim(game_id)) > 0)"
+        },
         {
           "name": "wager_transactions_kind_check",
           "expression": "\"kind\" in ('OPENING', 'BET', 'WIN', 'LOSS', 'REFUND', 'ROLLBACK')",
@@ -682,13 +782,69 @@
           "columnName": "kind"
         },
         {
+          "name": "wager_transactions_reference_attempts_check",
+          "expression": "reference_attempts >= 0",
+          "definition": "check (reference_attempts >= 0)"
+        },
+        {
+          "name": "wager_transactions_reference_not_blank_check",
+          "expression": "reference_external_transaction_id is null or length(btrim(reference_external_transaction_id)) > 0",
+          "definition": "check (reference_external_transaction_id is null or length(btrim(reference_external_transaction_id)) > 0)"
+        },
+        {
+          "name": "wager_transactions_resolved_reference_check",
+          "expression": "(reference_transaction_id is null or reference_external_transaction_id is not null) and (reference_transaction_id is null or reference_transaction_id <> id) and (status <> 'PENDING_REFERENCE' or (reference_external_transaction_id is not null and reference_transaction_id is null)) and (status <> 'PROCESSED' or reference_external_transaction_id is null or reference_transaction_id is not null)",
+          "definition": "check ((reference_transaction_id is null or reference_external_transaction_id is not null) and (reference_transaction_id is null or reference_transaction_id <> id) and (status <> 'PENDING_REFERENCE' or (reference_external_transaction_id is not null and reference_transaction_id is null)) and (status <> 'PROCESSED' or reference_external_transaction_id is null or reference_transaction_id is not null))"
+        },
+        {
+          "name": "wager_transactions_result_balance_pair_check",
+          "expression": "(result_balance_amount is null) = (result_balance_currency is null)",
+          "definition": "check ((result_balance_amount is null) = (result_balance_currency is null))"
+        },
+        {
+          "name": "wager_transactions_result_balance_value_check",
+          "expression": "result_balance_amount is null or (result_balance_amount >= 0 and result_balance_amount = trunc(result_balance_amount, 2))",
+          "definition": "check (result_balance_amount is null or (result_balance_amount >= 0 and result_balance_amount = trunc(result_balance_amount, 2)))"
+        },
+        {
+          "name": "wager_transactions_result_currency_format_check",
+          "expression": "result_balance_currency is null or (result_balance_currency ~ '^[A-Z]{3}$' and result_balance_currency = currency)",
+          "definition": "check (result_balance_currency is null or (result_balance_currency ~ '^[A-Z]{3}$' and result_balance_currency = currency))"
+        },
+        {
+          "name": "wager_transactions_retry_state_check",
+          "expression": "next_reference_attempt_at is null or status = 'PENDING_REFERENCE'",
+          "definition": "check (next_reference_attempt_at is null or status = 'PENDING_REFERENCE')"
+        },
+        {
           "name": "wager_transactions_status_check",
           "expression": "\"status\" in ('PENDING', 'PENDING_REFERENCE', 'PROCESSED', 'REJECTED', 'FAILED')",
           "definition": "check (\"status\" in ('PENDING', 'PENDING_REFERENCE', 'PROCESSED', 'REJECTED', 'FAILED'))",
           "columnName": "status"
+        },
+        {
+          "name": "wager_transactions_terminal_timestamp_check",
+          "expression": "(status in ('PROCESSED', 'REJECTED', 'FAILED') and processed_at is not null) or (status in ('PENDING', 'PENDING_REFERENCE') and processed_at is null)",
+          "definition": "check ((status in ('PROCESSED', 'REJECTED', 'FAILED') and processed_at is not null) or (status in ('PENDING', 'PENDING_REFERENCE') and processed_at is null))"
+        },
+        {
+          "name": "wager_transactions_timestamp_order_check",
+          "expression": "processed_at is null or processed_at >= created_at",
+          "definition": "check (processed_at is null or processed_at >= created_at)"
         }
       ],
-      "triggers": [],
+      "triggers": [
+        {
+          "name": "wager_transactions_validate_context",
+          "timing": "before",
+          "events": [
+            "insert",
+            "update"
+          ],
+          "forEach": "row",
+          "body": "\n        if tg_op = 'UPDATE' then\n          if old.status in ('PROCESSED', 'REJECTED', 'FAILED') and new is distinct from old then\n            raise exception 'terminal wager transactions are immutable' using errcode = '55000';\n          end if;\n\n          if new.id is distinct from old.id\n            or new.provider_id is distinct from old.provider_id\n            or new.external_transaction_id is distinct from old.external_transaction_id\n            or new.idempotency_key is distinct from old.idempotency_key\n            or new.payload_hash is distinct from old.payload_hash\n            or new.wallet_id is distinct from old.wallet_id\n            or new.player_id is distinct from old.player_id\n            or new.round_id is distinct from old.round_id\n            or new.game_id is distinct from old.game_id\n            or new.kind is distinct from old.kind\n            or new.amount is distinct from old.amount\n            or new.currency is distinct from old.currency\n            or new.reference_external_transaction_id is distinct from old.reference_external_transaction_id\n            or new.created_at is distinct from old.created_at then\n            raise exception 'wager transaction identity is immutable' using errcode = '55000';\n          end if;\n        end if;\n\n        if not exists (\n          select 1\n          from wallets wallet\n          where wallet.id = new.wallet_id\n            and wallet.player_id = new.player_id\n            and wallet.currency = new.currency\n        ) then\n          raise exception 'wager transaction wallet context does not match' using errcode = '23514';\n        end if;\n\n        if new.reference_transaction_id is not null and not exists (\n          select 1\n          from wager_transactions referenced\n          where referenced.id = new.reference_transaction_id\n            and referenced.external_transaction_id = new.reference_external_transaction_id\n            and referenced.provider_id = new.provider_id\n            and referenced.player_id = new.player_id\n            and referenced.wallet_id = new.wallet_id\n            and referenced.currency = new.currency\n            and referenced.round_id = new.round_id\n            and referenced.status = 'PROCESSED'\n            and (\n              (new.kind = 'WIN' and referenced.kind = 'BET')\n              or (new.kind = 'REFUND' and referenced.kind = 'BET' and new.amount = referenced.amount)\n              or (new.kind = 'ROLLBACK' and referenced.kind in ('BET', 'WIN', 'REFUND') and new.amount = referenced.amount)\n            )\n        ) then\n          raise exception 'wager transaction reference context does not match' using errcode = '23514';\n        end if;\n\n        return new;\n      "
+        }
+      ],
       "foreignKeys": {
         "wager_transactions_reference_transaction_id_foreign": {
           "columnNames": [
@@ -867,7 +1023,7 @@
           "autoincrement": false,
           "primary": false,
           "nullable": false,
-          "unique": false,
+          "unique": true,
           "length": null,
           "precision": null,
           "scale": null,
@@ -888,17 +1044,73 @@
           "keyName": "wallet_ledger_entries_pkey",
           "primary": true,
           "unique": true
+        },
+        {
+          "columnNames": [
+            "wallet_id",
+            "transaction_id"
+          ],
+          "composite": true,
+          "constraint": true,
+          "keyName": "wallet_ledger_entries_wallet_transaction_unique",
+          "primary": false,
+          "unique": true
         }
       ],
       "checks": [
+        {
+          "name": "wallet_ledger_entries_amount_positive_check",
+          "expression": "amount > 0",
+          "definition": "check (amount > 0)"
+        },
+        {
+          "name": "wallet_ledger_entries_arithmetic_check",
+          "expression": "(direction = 'DEBIT' and balance_before - amount = balance_after) or (direction = 'CREDIT' and balance_before + amount = balance_after)",
+          "definition": "check ((direction = 'DEBIT' and balance_before - amount = balance_after) or (direction = 'CREDIT' and balance_before + amount = balance_after))"
+        },
+        {
+          "name": "wallet_ledger_entries_currency_format_check",
+          "expression": "currency ~ '^[A-Z]{3}$'",
+          "definition": "check (currency ~ '^[A-Z]{3}$')"
+        },
         {
           "name": "wallet_ledger_entries_direction_check",
           "expression": "\"direction\" in ('DEBIT', 'CREDIT')",
           "definition": "check (\"direction\" in ('DEBIT', 'CREDIT'))",
           "columnName": "direction"
+        },
+        {
+          "name": "wallet_ledger_entries_monetary_scale_check",
+          "expression": "amount = trunc(amount, 2) and balance_before = trunc(balance_before, 2) and balance_after = trunc(balance_after, 2)",
+          "definition": "check (amount = trunc(amount, 2) and balance_before = trunc(balance_before, 2) and balance_after = trunc(balance_after, 2))"
+        },
+        {
+          "name": "wallet_ledger_entries_nonnegative_balances_check",
+          "expression": "balance_before >= 0 and balance_after >= 0",
+          "definition": "check (balance_before >= 0 and balance_after >= 0)"
         }
       ],
-      "triggers": [],
+      "triggers": [
+        {
+          "name": "wallet_ledger_entries_immutable",
+          "timing": "before",
+          "events": [
+            "update",
+            "delete"
+          ],
+          "forEach": "row",
+          "body": "\n        raise exception 'wallet ledger entries are immutable' using errcode = '55000';\n        return old;\n      "
+        },
+        {
+          "name": "wallet_ledger_entries_validate_context",
+          "timing": "before",
+          "events": [
+            "insert"
+          ],
+          "forEach": "row",
+          "body": "\n        if not exists (\n          select 1\n          from wager_transactions wager\n          where wager.id = new.transaction_id\n            and wager.wallet_id = new.wallet_id\n            and wager.currency = new.currency\n            and wager.amount = new.amount\n            and wager.status = 'PROCESSED'\n            and wager.kind <> 'LOSS'\n        ) then\n          raise exception 'ledger transaction context does not match' using errcode = '23514';\n        end if;\n\n        return new;\n      "
+        }
+      ],
       "foreignKeys": {
         "wallet_ledger_entries_transaction_id_foreign": {
           "columnNames": [
@@ -1006,7 +1218,7 @@
           "autoincrement": false,
           "primary": false,
           "nullable": false,
-          "unique": false,
+          "unique": true,
           "length": null,
           "precision": null,
           "scale": null,
@@ -1061,10 +1273,57 @@
           "keyName": "wallets_pkey",
           "primary": true,
           "unique": true
+        },
+        {
+          "columnNames": [
+            "player_id",
+            "currency"
+          ],
+          "composite": true,
+          "constraint": true,
+          "keyName": "wallets_player_id_currency_unique",
+          "primary": false,
+          "unique": true
         }
       ],
-      "checks": [],
-      "triggers": [],
+      "checks": [
+        {
+          "name": "wallets_balance_nonnegative_check",
+          "expression": "balance >= 0",
+          "definition": "check (balance >= 0)"
+        },
+        {
+          "name": "wallets_balance_scale_check",
+          "expression": "balance = trunc(balance, 2)",
+          "definition": "check (balance = trunc(balance, 2))"
+        },
+        {
+          "name": "wallets_currency_format_check",
+          "expression": "currency ~ '^[A-Z]{3}$'",
+          "definition": "check (currency ~ '^[A-Z]{3}$')"
+        },
+        {
+          "name": "wallets_timestamp_order_check",
+          "expression": "updated_at >= created_at",
+          "definition": "check (updated_at >= created_at)"
+        },
+        {
+          "name": "wallets_version_positive_check",
+          "expression": "version >= 1",
+          "definition": "check (version >= 1)"
+        }
+      ],
+      "triggers": [
+        {
+          "name": "wallets_protect_identity_and_version",
+          "timing": "before",
+          "events": [
+            "update"
+          ],
+          "forEach": "row",
+          "body": "\n        if new.id is distinct from old.id\n          or new.player_id is distinct from old.player_id\n          or new.currency is distinct from old.currency\n          or new.created_at is distinct from old.created_at then\n          raise exception 'wallet identity is immutable' using errcode = '55000';\n        end if;\n\n        if new.balance is distinct from old.balance then\n          if new.version <> old.version + 1 then\n            raise exception 'wallet version must increment exactly once with balance' using errcode = '23514';\n          end if;\n        elsif new.version is distinct from old.version then\n          raise exception 'wallet version cannot change without balance' using errcode = '23514';\n        end if;\n\n        return new;\n      "
+        }
+      ],
       "foreignKeys": {},
       "comment": null
     }
