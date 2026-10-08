@@ -40,7 +40,7 @@ AppModule
     └── SQS health indicator ── AWS SDK v3 ── MiniStack/SQS
 ```
 
-Ainda não existem endpoints financeiros, entidades persistentes, consumidor SQS, inbox, outbox ou workers. O domínio puro implementado até aqui contém `Money`, o aggregate `Wallet`, `WagerTransaction` e `WalletLedgerEntry`; os demais elementos serão adicionados nas fases específicas do roadmap.
+Ainda não existem endpoints financeiros, entidades persistentes, consumidor SQS ou workers. O domínio puro da Fase 2 contém `Money`, `Wallet`, `WagerTransaction`, `WalletLedgerEntry`, os modelos de inbox/outbox e os eventos de integração; persistência e execução desses modelos serão adicionadas nas fases específicas do roadmap.
 
 ## 4. Boundaries e dependências
 
@@ -171,6 +171,18 @@ O baseline atual não cria tabelas de domínio. Sua função é provar a cadeia 
 - **Evidência:** testes unitários cobrem crédito, débito até zero, valores além do limite seguro do JavaScript, identidade, timestamp, moedas divergentes, valores não positivos, saldos negativos, aritmética incorreta, direção desconhecida, imutabilidade e reidratação de dados inconsistentes.
 - **Limitação e gatilho de revisão:** `Object.freeze` protege a instância em memória, mas não impede alterações no banco. A constraint única `(walletId, transactionId)`, as foreign keys e a proteção contra `UPDATE`/`DELETE` serão definidas e testadas na fase de persistência. A regra que impede ledger para `LOSS` ou transação rejeitada pertence ao caso de uso atômico.
 
+### D-013 — Inbox, outbox e eventos permanecem puros e orientados à persistência
+
+- **Status:** confirmada para os modelos e envelopes de domínio; persistência, claims concorrentes, backoff concreto e publicação SQS continuam abertos.
+- **Requisito protegido:** deduplicação precisa ser persistente, eventos financeiros só podem ser publicados depois do commit e seus payloads precisam ser estáveis, imutáveis, versionados e serializáveis como JSON.
+- **Alternativas consideradas:** usar cache em memória para inbox foi rejeitado pelo desafio; publicar diretamente durante o caso de uso foi rejeitado porque pode preceder ou escapar do commit; colocar instâncias de `Money` nos eventos foi rejeitado porque acopla o contrato ao domínio e produz serialização instável; fixar agora quantidade de tentativas ou atrasos foi rejeitado por falta de evidência operacional.
+- **Escolha para inbox:** `InboxMessage` guarda `(consumerName, messageId)`, hash do payload, recebimento e processamento. `matchesPayload()` distingue replay idêntico de conflito e `markProcessed()` só pode ocorrer uma vez. A constraint composta e a atomicidade com os efeitos financeiros serão responsabilidade do PostgreSQL.
+- **Escolha para eventos:** a classe abstrata `IntegrationEvent<T>` produz envelope com IDs, correlação, causação opcional, timestamp ISO-8601, tipo e versão definidos pela subclasse. Os quatro eventos obrigatórios possuem versão `1`; dados monetários usam `MoneyProps`. O payload é copiado e congelado recursivamente e rejeita classes, `undefined`, `NaN` e `Infinity`.
+- **Escolha para outbox:** `OutboxMessage` é criado a partir do envelope completo, inicia pendente com zero tentativas, registra agendamento e publicação e não aceita transições depois de publicado. `scheduleRetry` recebe uma política, incrementa tentativas somente após obter um agendamento válido e não embute números arbitrários de backoff.
+- **Trade-off:** os modelos expressam estados e contratos sem importar MikroORM ou AWS SDK, mas sozinhos não garantem deduplicação, claim exclusivo, recuperação de publisher morto ou publicação após commit. Essas garantias dependem da mesma transação SQL e dos workers das fases posteriores.
+- **Evidência:** testes unitários cobrem replay e conflito de payload, terminalidade de inbox/outbox, timestamps defensivos, retry injetado, falha de agendamento sem mutação, serialização JSON profunda, rejeição de dados instáveis, envelopes versionados, todos os eventos obrigatórios e validação de suas entidades de origem.
+- **Limitação e gatilho de revisão:** limites de retry, backoff, leasing/locking, recuperação, ordem de publicação e comportamento com dois publishers só serão escolhidos após implementação e testes com PostgreSQL e SQS reais.
+
 ## 6. Decisões abertas
 
 Nenhuma alternativa desta tabela está escolhida antecipadamente.
@@ -196,7 +208,7 @@ Nenhuma alternativa desta tabela está escolhida antecipadamente.
 
 ## 7. Modelo transacional — estado atual
 
-O modelo transacional financeiro permanece aberto. `Wallet` já expressa mudanças locais de saldo, `WagerTransaction` expressa estados e referências e `WalletLedgerEntry` valida a aritmética do lançamento, mas os casos de uso e as garantias de persistência ainda não foram implementados. A restrição estabelecida é:
+O modelo transacional financeiro permanece aberto. As entidades financeiras, inbox, outbox e eventos já expressam seus estados locais, mas os casos de uso e as garantias de persistência ainda não foram implementados. A restrição estabelecida é:
 
 ```text
 wallet + ledger + wager transaction + inbox + outbox
@@ -228,11 +240,11 @@ bun run migration:up
 bun run migration:down
 ```
 
-O ciclo de migration deve ser comprovado em banco descartável antes de alterações reais de schema. Testes de integração e concorrência serão adicionados nas fases correspondentes; os testes atuais comprovam o runner do Bun, a normalização básica da configuração e o comportamento puro de `Money`, `Wallet`, `WagerTransaction` e `WalletLedgerEntry`.
+O ciclo de migration deve ser comprovado em banco descartável antes de alterações reais de schema. Testes de integração e concorrência serão adicionados nas fases correspondentes; os testes atuais comprovam o runner do Bun, a normalização básica da configuração e o comportamento puro das entidades, mensagens e eventos da Fase 2.
 
 ## 10. Limitações atuais
 
-- o modelo de domínio financeiro ainda está limitado a `Money`, `Wallet`, `WagerTransaction` e `WalletLedgerEntry`;
+- os modelos puros da Fase 2 ainda não possuem casos de uso nem persistência;
 - não existem tabelas de negócio ou constraints financeiras;
 - não existem endpoints de wallet, wagering ou ledger;
 - não existem consumer, inbox, outbox ou publisher;
