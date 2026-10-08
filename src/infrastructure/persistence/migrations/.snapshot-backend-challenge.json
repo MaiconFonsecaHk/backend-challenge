@@ -267,6 +267,34 @@
       "indexes": [
         {
           "columnNames": [
+            "next_attempt_at",
+            "occurred_at",
+            "id"
+          ],
+          "composite": true,
+          "constraint": false,
+          "keyName": "outbox_messages_pending_due_idx",
+          "primary": false,
+          "unique": false,
+          "where": "\"published_at\" is null",
+          "columns": [
+            {
+              "name": "next_attempt_at",
+              "sort": "ASC",
+              "nulls": "FIRST"
+            },
+            {
+              "name": "occurred_at",
+              "sort": "ASC"
+            },
+            {
+              "name": "id",
+              "sort": "ASC"
+            }
+          ]
+        },
+        {
+          "columnNames": [
             "id"
           ],
           "composite": false,
@@ -712,6 +740,29 @@
         },
         {
           "columnNames": [
+            "next_reference_attempt_at",
+            "id"
+          ],
+          "composite": true,
+          "constraint": false,
+          "keyName": "wager_transactions_pending_reference_due_idx",
+          "primary": false,
+          "unique": false,
+          "where": "\"status\" = 'PENDING_REFERENCE'",
+          "columns": [
+            {
+              "name": "next_reference_attempt_at",
+              "sort": "ASC",
+              "nulls": "FIRST"
+            },
+            {
+              "name": "id",
+              "sort": "ASC"
+            }
+          ]
+        },
+        {
+          "columnNames": [
             "id"
           ],
           "composite": false,
@@ -1044,6 +1095,18 @@
           "keyName": "wallet_ledger_entries_pkey",
           "primary": true,
           "unique": true
+        },
+        {
+          "columnNames": [
+            "wallet_id",
+            "created_at",
+            "id"
+          ],
+          "composite": true,
+          "constraint": false,
+          "keyName": "wallet_ledger_entries_wallet_cursor_idx",
+          "primary": false,
+          "unique": false
         },
         {
           "columnNames": [

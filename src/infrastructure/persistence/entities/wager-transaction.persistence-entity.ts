@@ -114,6 +114,17 @@ const WagerTransactionPersistenceSchema = defineEntity({
         `${columns.processedAt} is null or ${columns.processedAt} >= ${columns.createdAt}`,
     },
   ],
+  indexes: [
+    {
+      name: 'wager_transactions_pending_reference_due_idx',
+      properties: ['nextReferenceAttemptAt', 'id'],
+      columns: [
+        { name: 'nextReferenceAttemptAt', nulls: 'FIRST', sort: 'ASC' },
+        { name: 'id', sort: 'ASC' },
+      ],
+      where: { status: WagerTransactionStatus.PendingReference },
+    },
+  ],
   properties: {
     id: p.uuid().primary(),
     providerId: p.text().fieldName('provider_id'),

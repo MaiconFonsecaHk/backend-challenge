@@ -30,6 +30,18 @@ const OutboxMessagePersistenceSchema = defineEntity({
         `${columns.publishedAt} >= ${columns.occurredAt})`,
     },
   ],
+  indexes: [
+    {
+      name: 'outbox_messages_pending_due_idx',
+      properties: ['nextAttemptAt', 'occurredAt', 'id'],
+      columns: [
+        { name: 'nextAttemptAt', nulls: 'FIRST', sort: 'ASC' },
+        { name: 'occurredAt', sort: 'ASC' },
+        { name: 'id', sort: 'ASC' },
+      ],
+      where: { publishedAt: null },
+    },
+  ],
   properties: {
     id: p.uuid().primary(),
     aggregateId: p.uuid().fieldName('aggregate_id'),

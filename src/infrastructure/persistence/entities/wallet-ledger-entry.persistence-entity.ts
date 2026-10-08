@@ -37,6 +37,12 @@ const WalletLedgerEntryPersistenceSchema = defineEntity({
         `${columns.balanceBefore} + ${columns.amount} = ${columns.balanceAfter})`,
     },
   ],
+  indexes: [
+    {
+      name: 'wallet_ledger_entries_wallet_cursor_idx',
+      properties: ['walletId', 'createdAt', 'id'],
+    },
+  ],
   properties: {
     id: p.uuid().primary(),
     walletId: () =>

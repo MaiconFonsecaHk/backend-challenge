@@ -42,7 +42,7 @@ AppModule
     └── SQS health indicator ── AWS SDK v3 ── MiniStack/SQS
 ```
 
-Ainda não existem endpoints financeiros, consumidor SQS ou workers. O domínio puro da Fase 2 contém `Money`, `Wallet`, `WagerTransaction`, `WalletLedgerEntry`, os modelos de inbox/outbox e os eventos de integração. A infraestrutura já descreve e materializa os cinco modelos persistentes com suas constraints obrigatórias; índices de consulta, repositórios e casos de uso continuam nas etapas específicas do roadmap.
+Ainda não existem endpoints financeiros, consumidor SQS ou workers. O domínio puro da Fase 2 contém `Money`, `Wallet`, `WagerTransaction`, `WalletLedgerEntry`, os modelos de inbox/outbox e os eventos de integração. A infraestrutura já descreve e materializa os cinco modelos persistentes com suas constraints obrigatórias e com três índices derivados de acessos demonstrados; repositórios e casos de uso continuam nas etapas específicas do roadmap.
 
 ## 4. Boundaries e dependências
 
@@ -188,7 +188,7 @@ O baseline permanece neutro e prova a cadeia inicial. A migration seguinte cont�
 
 ### D-014 — Modelos do MikroORM separados do domínio e registrados explicitamente
 
-- **Status:** confirmada para desenho, descoberta, DDL e constraints; índices de consulta e round-trip automatizado em PostgreSQL real continuam abertos.
+- **Status:** confirmada para desenho, descoberta, DDL, constraints e índices de consulta; o round-trip automatizado em PostgreSQL real continua aberto.
 - **Requisito protegido:** o domínio deve permanecer independente do ORM, dinheiro não pode passar por `number` e runtime, CLI e migrations precisam descobrir o mesmo conjunto de modelos.
 - **Alternativas consideradas:** decorators do MikroORM nas entidades de domínio foram rejeitados por inverter a direção de dependência; `autoLoadEntities` isolado foi rejeitado porque só descobre entidades registradas em módulos Nest e não configura a CLI; mapear `Money` como objeto opaco foi rejeitado porque esconderia valor e moeda do schema; enums nativos do PostgreSQL não foram escolhidos porque aumentam o custo de evolução e reversão sem benefício demonstrado neste momento.
 - **Escolha:** cinco classes de persistência definidas com `defineEntity` vivem em `infrastructure`: wallet, wager transaction, ledger, inbox e outbox. Um registro único e explícito alimenta tanto o bootstrap do NestJS quanto a configuração da CLI. Relações financeiras usam foreign keys mapeadas para IDs escalares, evitando que referências do ORM atravessem a futura fronteira dos repositórios.
@@ -209,6 +209,18 @@ O baseline permanece neutro e prova a cadeia inicial. A migration seguinte cont�
 - **Trade-off:** triggers oferecem defesa final para invariantes relacionais, mas aumentam a complexidade do schema e exigem que a aplicação traduza SQLSTATEs estáveis. Operações administrativas capazes de desabilitar triggers permanecem fora do papel da aplicação e deverão ser restringidas operacionalmente.
 - **Evidência:** PostgreSQL real aceitou um conjunto coerente de wallet, aposta processada, ledger, inbox e outbox; 22 tentativas inválidas foram rejeitadas pela constraint ou trigger nominal esperada. O catálogo confirmou 39 checks/unicidades nomeados e quatro triggers. O rollback removeu os objetos gerenciados, a reaplicação os restaurou e a comparação final não encontrou drift.
 - **Limitação e gatilho de revisão:** a igualdade agregada entre saldo materializado e soma do ledger não é uma constraint de uma única linha. Ela será garantida pelo limite transacional do caso de uso e comprovada por testes de rollback, concorrência e reconciliação. A automação desses testes contra PostgreSQL continua no item de integração do schema.
+
+### D-016 — Índices seguem acessos demonstrados e evitam duplicar unicidades
+
+- **Status:** confirmada para os três padrões de acesso conhecidos nesta fase.
+- **Requisito protegido:** paginação estável do ledger, recuperação de referências pendentes e publicação da outbox precisam localizar o próximo lote sem ordenar ou percorrer todo o conjunto elegível.
+- **Alternativas consideradas:** criar índices para todas as colunas consultáveis foi rejeitado como otimização especulativa; índices adicionais para identidade da wallet, idempotency key, identidade externa do provider e identidade da inbox foram rejeitados porque as respectivas constraints únicas ou chave primária já fornecem índices; índices completos para workers foram rejeitados porque incluiriam linhas terminais que nunca voltam à fila de trabalho; `INCLUDE` e índices de cobertura mais largos foram adiados por não haver leitura implementada que justifique o custo adicional.
+- **Escolha para ledger:** o B-tree `(wallet_id, created_at, id)` atende a consulta por wallet e ao cursor composto determinístico. A mesma estrutura pode ser percorrida em ordem inversa para `ORDER BY created_at DESC, id DESC`, enquanto `id` desempata timestamps iguais.
+- **Escolha para referências pendentes:** o índice parcial `(next_reference_attempt_at ASC NULLS FIRST, id ASC) WHERE status = 'PENDING_REFERENCE'` mantém somente trabalho recuperável e entrega a ordem estável de seleção do lote.
+- **Escolha para outbox:** o índice parcial `(next_attempt_at ASC NULLS FIRST, occurred_at ASC, id ASC) WHERE published_at IS NULL` mantém somente mensagens ainda não publicadas, prioriza o agendamento e usa ocorrência e ID como desempates determinísticos.
+- **Trade-off:** os três índices consomem armazenamento e ampliam o custo de escrita. Os índices parciais reduzem esse custo ao excluir estados concluídos, mas exigem que as consultas mantenham predicados compatíveis com seus filtros. O instante limite continua como filtro porque registros sem agendamento e registros já vencidos compartilham a mesma fila ordenada.
+- **Evidência:** em PostgreSQL real, após `ANALYZE`, uma base com 5.000 lançamentos de ledger, 10.000 transações e 10.000 mensagens de outbox fez o planner escolher naturalmente os três índices, sem desabilitar sequential scan: `Index Scan Backward` no ledger e `Index Only Scan` nos dois workers. Testes de metadados verificam o conjunto exato e os predicados parciais. A migration removeu os três índices no `down`, restaurou-os no `up` e a comparação final não encontrou drift.
+- **Limitação e gatilho de revisão:** planos dependem de distribuição, cardinalidade, estatísticas e consultas reais. Os repositórios deverão preservar os predicados e a ordenação comprovados; métricas de produção ou novos padrões de acesso podem justificar revisão, remoção ou novos índices com nova evidência de `EXPLAIN (ANALYZE, BUFFERS)`.
 
 ## 6. Decisões abertas
 
@@ -267,12 +279,12 @@ bun run migration:up
 bun run migration:down
 ```
 
-O ciclo `up → inspeção → down → inspeção → up` foi comprovado em banco PostgreSQL temporário, seguido por uma comparação sem drift entre banco, snapshot e metadados. As constraints também foram exercitadas diretamente com um fixture válido e 22 violações intencionais. A automação de integração e os testes de concorrência serão adicionados nas fases correspondentes; os testes atuais também comprovam o runner do Bun, a normalização básica da configuração, o comportamento puro da Fase 2 e a descoberta dos modelos persistentes.
+O ciclo `up → inspeção → down → inspeção → up` foi comprovado em banco PostgreSQL temporário, seguido por uma comparação sem drift entre banco, snapshot e metadados. As constraints também foram exercitadas diretamente com um fixture válido e 22 violações intencionais. Os três índices orientados a acesso foram validados com dados representativos e `EXPLAIN (ANALYZE, BUFFERS)`, que selecionou naturalmente cada índice pretendido. A automação de integração e os testes de concorrência serão adicionados nas fases correspondentes; os testes atuais também comprovam o runner do Bun, a normalização básica da configuração, o comportamento puro da Fase 2 e a descoberta dos modelos persistentes.
 
 ## 10. Limitações atuais
 
 - os modelos puros da Fase 2 ainda não possuem casos de uso, mappers nem repositórios;
-- tabelas e constraints obrigatórias existem, mas ainda faltam índices orientados aos acessos demonstrados;
+- tabelas, constraints obrigatórias e índices para os três acessos demonstrados existem, mas ainda faltam repositórios e testes automatizados de integração contra o schema real;
 - não existem endpoints de wallet, wagering ou ledger;
 - não existem consumer, inbox, outbox ou publisher;
 - não existem garantias implementadas de concorrência ou idempotência;

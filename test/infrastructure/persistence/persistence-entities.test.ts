@@ -228,3 +228,29 @@ describe('database-enforced invariants', () => {
     ]);
   });
 });
+
+describe('access-pattern indexes', () => {
+  test('declares only the additional indexes required by non-unique access paths', () => {
+    expect(
+      entityMetadata(ENTITY_NAMES.ledger).indexes.map((index) => index.name),
+    ).toEqual(['wallet_ledger_entries_wallet_cursor_idx']);
+    expect(
+      entityMetadata(ENTITY_NAMES.wager).indexes.map((index) => index.name),
+    ).toEqual(['wager_transactions_pending_reference_due_idx']);
+    expect(
+      entityMetadata(ENTITY_NAMES.outbox).indexes.map((index) => index.name),
+    ).toEqual(['outbox_messages_pending_due_idx']);
+    expect(entityMetadata(ENTITY_NAMES.wallet).indexes).toEqual([]);
+    expect(entityMetadata(ENTITY_NAMES.inbox).indexes).toEqual([]);
+  });
+
+  test('keeps worker indexes partial so completed rows do not increase their size', () => {
+    const pendingReferenceIndex = entityMetadata(ENTITY_NAMES.wager).indexes[0];
+    const pendingOutboxIndex = entityMetadata(ENTITY_NAMES.outbox).indexes[0];
+
+    expect(pendingReferenceIndex?.where).toEqual({
+      status: WagerTransactionStatus.PendingReference,
+    });
+    expect(pendingOutboxIndex?.where).toEqual({ publishedAt: null });
+  });
+});
