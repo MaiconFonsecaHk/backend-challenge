@@ -40,6 +40,9 @@ AppModule
 │       └── PostgreSQL
 ├── WalletApplicationModule
 │   ├── CreateWalletUseCase
+│   ├── GetWalletUseCase
+│   ├── GetWalletLedgerUseCase
+│   ├── Base64UrlLedgerCursorCodec
 │   ├── UuidGenerator
 │   └── SystemClock
 └── HealthModule
@@ -48,7 +51,7 @@ AppModule
     └── SQS health indicator ── AWS SDK v3 ── MiniStack/SQS
 ```
 
-Ainda não existem endpoints financeiros, consumidor SQS ou workers. O domínio puro da Fase 2 contém `Money`, `Wallet`, `WagerTransaction`, `WalletLedgerEntry`, os modelos de inbox/outbox e os eventos de integração. A infraestrutura materializa os cinco modelos persistentes com constraints, índices, mappers, repositórios e Unit of Work transacional. A aplicação já possui o caso de uso de criação de wallet; os demais casos de uso continuam nas etapas específicas do roadmap.
+Ainda não existem endpoints financeiros, consumidor SQS ou workers. O domínio puro da Fase 2 contém `Money`, `Wallet`, `WagerTransaction`, `WalletLedgerEntry`, os modelos de inbox/outbox e os eventos de integração. A infraestrutura materializa os cinco modelos persistentes com constraints, índices, mappers, repositórios e Unit of Work transacional. A aplicação possui os casos de uso de criação e consulta de wallet e de consulta paginada do ledger; os demais casos de uso continuam nas etapas específicas do roadmap.
 
 ## 4. Boundaries e dependências
 
@@ -237,7 +240,7 @@ O baseline permanece neutro e prova a cadeia inicial. A migration seguinte cont�
 - **Escolha para os mappers:** cada modelo possui conversão explícita entre persistência e domínio. Valores `numeric` permanecem strings e são normalizados para duas casas antes de criar `Money`; valores maiores que o limite seguro do JavaScript não passam por `number`. Campos opcionais são convertidos conscientemente entre `null` do banco e `undefined` do domínio, e payloads de outbox voltam a passar pela cópia imutável do modelo.
 - **Escolha para o Unit of Work:** `MikroOrmUnitOfWork.execute()` abre `EntityManager.transactional()` e cria todos os repositórios com o mesmo `EntityManager` transacional. Os adapters apenas registram inclusões ou atribuem estado mutável; nenhum chama `flush`, inicia transação própria ou publica evento. O provider é exportado por token de aplicação, não pela classe concreta do ORM.
 - **Atualizações:** `add` é explícito e `save` exige que o registro já exista, falhando em vez de transformar silenciosamente uma atualização em inserção. Wallet, wager transaction, inbox e outbox atualizam somente seus campos mutáveis; identidade e payload imutáveis não são reassinados. Ledger permanece sem caminho de atualização ou exclusão.
-- **Trade-off:** todo caso de uso persistente precisa entrar pelo callback do Unit of Work e construir o registro operacional completo da transação de aposta. Essa disciplina acrescenta tipos e mappers, mas deixa o limite transacional visível e testável. Consultas de worker, locking, paginação do ledger e tradução de erros SQL continuam fora desses contratos até suas decisões próprias.
+- **Trade-off:** todo caso de uso persistente precisa entrar pelo callback do Unit of Work e construir o registro operacional completo da transação de aposta. Essa disciplina acrescenta tipos e mappers, mas deixa o limite transacional visível e testável. Consultas de worker, locking e tradução de erros SQL continuam fora desses contratos até suas decisões próprias; a paginação do ledger foi adicionada por um contrato específico de leitura, sem ampliar a superfície mutável do repositório append-only.
 - **Evidência:** testes unitários exercitam round-trip exato dos cinco modelos, saldo original e estado de referência; verificam identidades de consulta, inclusão sem flush, atualização restrita, ausência de update no ledger, falha explícita de `save` inexistente, compartilhamento do mesmo `EntityManager` e propagação de erro. No PostgreSQL real, a Unit of Work confirmou atomicamente wallet, `OPENING`, ledger, inbox e outbox; outra execução enviou primeiro o `INSERT` da wallet, falhou depois na constraint da transação dependente e o `ROLLBACK` removeu ambos os efeitos. Type-check e build validam a composição do provider no NestJS.
 - **Limitação e gatilho de revisão:** o limite técnico está comprovado, mas cada caso de uso financeiro ainda precisa demonstrar que inclui todos os efeitos exigidos e que sua estratégia de concorrência preserva o mesmo limite sob disputa real.
 
@@ -248,7 +251,7 @@ O baseline permanece neutro e prova a cadeia inicial. A migration seguinte cont�
 - **Alternativas consideradas:** mocks ou banco em memória foram rejeitados porque não reproduzem `numeric`, SQLSTATE, constraints, triggers e transações do PostgreSQL; limpar o banco padrão foi rejeitado por risco de perda de dados e interferência entre execuções; schema temporário foi considerado, mas um banco dedicado representa melhor o ciclo de instalação desde zero e evita vazamento de `search_path`; Testcontainers foi adiado porque o Docker Compose obrigatório já fornece a infraestrutura e outra dependência não acrescentaria uma garantia nova nesta fase.
 - **Escolha:** `test:integration:postgres` conecta ao PostgreSQL do Compose, cria um banco com prefixo validado `backend_challenge_it_`, aplica a lista explícita de migrations e remove exclusivamente esse banco no `afterAll`, inclusive após falha. O nome aleatório permite execuções independentes e o descarte encerra conexões remanescentes antes do `DROP DATABASE`.
 - **Trade-off:** o teste exige PostgreSQL acessível e permissão `CREATEDB`, por isso permanece em script dedicado e é ignorado pela suíte unitária quando a flag explícita não está presente. Em troca, a prova é fiel ao driver e mantém `bun run test` rápido e utilizável sem infraestrutura.
-- **Evidência:** sete testes reais aplicam quatro migrations em banco limpo, persistem e reidratam os cinco modelos, exercitam a abertura completa de wallet, verificam constraints e imutabilidade, observam `BEGIN`, inserts, `ROLLBACK`, ausência dos efeitos revertidos, executam todos os `down`, confirmam zero tabelas da aplicação e reaplicam o schema completo. A consulta administrativa após a suíte confirma que nenhum banco temporário permanece.
+- **Evidência:** oito testes reais aplicam quatro migrations em banco limpo, persistem e reidratam os cinco modelos, exercitam a abertura completa de wallet, consultam wallet e ledger paginado, verificam constraints e imutabilidade, observam `BEGIN`, inserts, `ROLLBACK`, ausência dos efeitos revertidos, executam todos os `down`, confirmam zero tabelas da aplicação e reaplicam o schema completo. A consulta administrativa após a suíte confirma que nenhum banco temporário permanece.
 
 ### D-019 — Abertura de wallet é uma operação financeira atômica
 
@@ -259,7 +262,17 @@ O baseline permanece neutro e prova a cadeia inicial. A migration seguinte cont�
 - **IDs e tempo:** IDs internos são UUID v4 gerados na aplicação pela porta `IdGenerator`, usando `crypto.randomUUID()` sem nova dependência. Um único instante vindo da porta `Clock` alimenta wallet, transação, ledger e evento, evitando divergência dentro da operação. Chaves primárias e unicidades do PostgreSQL permanecem a defesa final contra colisões e duplicidade.
 - **Trade-off:** o pré-check permite erro de aplicação legível para duplicidade já existente, mas duas criações simultâneas ainda disputam a constraint única; a tradução dessa violação concorrente para conflito HTTP será fechada junto ao mapeamento de erros da API. UUID v4 não oferece localidade temporal, porém os cursores usam `(createdAt, id)` e não dependem de ID ordenável. O relógio da aplicação exige sincronização operacional entre instâncias; nenhuma invariante financeira depende da ordem física desses timestamps.
 - **Evidência:** testes unitários comprovam saldo positivo, saldo zero, identidade duplicada, correlação obrigatória e geração UUID v4. Em PostgreSQL real, o caso de uso persiste e reidrata wallet, `OPENING`, ledger e outbox, e uma consulta reconcilia saldo materializado com o ledger. Um segundo cenário deixa inserts chegarem ao banco, força falha no UUID da `OPENING`, observa `ROLLBACK` e confirma ausência de wallet e outbox.
-- **Limitação e gatilho de revisão:** ainda não existem controller HTTP, tradução da corrida de unicidade, consultas públicas, paginação do ledger ou reconciliação operacional; esses itens permanecem nos blocos seguintes.
+- **Limitação e gatilho de revisão:** ainda não existem controller HTTP, tradução da corrida de unicidade ou reconciliação operacional. As consultas existem na aplicação, mas só serão expostas publicamente quando os contratos e o mapeamento HTTP forem implementados.
+
+### D-020 — Consultas retornam snapshots estáveis e o ledger usa cursor composto
+
+- **Status:** confirmada para os casos de uso de consulta, o adapter MikroORM e a codificação do cursor; o contrato HTTP continua para a fase de API.
+- **Requisito protegido:** a consulta de wallet precisa devolver o estado materializado sem expor entidades internas, e o histórico do ledger precisa manter ordem determinística e continuidade sem duplicar ou saltar entradas quando timestamps empatam ou novas entradas são inseridas entre páginas.
+- **Alternativas consideradas:** paginação por offset foi rejeitada porque inserções concorrentes deslocam as páginas; cursor apenas por timestamp foi rejeitado porque não ordena empates; cursor apenas por UUID foi rejeitado porque não representa a cronologia; uma consulta de contagem separada foi rejeitada por custo e por abrir outra janela de inconsistência; assinatura ou criptografia do cursor foi adiada porque o requisito atual exige opacidade e validação, não confidencialidade ou proteção criptográfica contra alteração.
+- **Escolha:** `GetWalletUseCase` e `GetWalletLedgerUseCase` retornam DTOs imutáveis com valores monetários em strings decimais e timestamps ISO. O ledger usa keyset pagination em ordem decrescente por `(createdAt, id)`, aplica o predicado estrito anterior ao cursor e solicita `limit + 1` para detectar a próxima página. O cursor contém versão, timestamp e ID em JSON canônico codificado como Base64URL sem padding; formatos não canônicos, versões desconhecidas, timestamps inválidos e estruturas extras são rejeitados com código estável.
+- **Trade-off:** Base64URL impede que o contrato dependa de campos visíveis, mas não é criptografia nem assinatura. Alterações malformadas são rejeitadas, enquanto um cliente pode construir outro cursor estruturalmente válido; isso não concede escrita nem acesso a outra wallet porque `walletId` permanece parâmetro independente da consulta. O valor padrão é `50`; a aplicação exige inteiro positivo e o limite superior do transporte será definido com o contrato HTTP, sem inventar antecipadamente uma política operacional.
+- **Evidência:** testes unitários cobrem wallet existente e ausente, DTOs imutáveis, limite padrão, limites inválidos, `limit + 1`, página final, codec determinístico e rejeição de cursores malformados. O teste com PostgreSQL real cria entradas com o mesmo timestamp, confirma desempate por ID, insere uma entrada mais nova entre páginas e demonstra que a continuação pelo cursor não deriva nem repete resultados; uma consulta nova observa a inserção imediatamente.
+- **Limitação e gatilho de revisão:** validação de UUIDs de rota, limite máximo de página, serialização HTTP e política de status pertencem ao adapter HTTP. Assinatura do cursor só será adicionada se surgir requisito de integridade contra manipulação ou se o cursor passar a carregar informação sensível.
 
 ## 6. Decisões abertas
 
@@ -276,7 +289,6 @@ Nenhuma alternativa desta tabela está escolhida antecipadamente.
 | Retry e backoff | recuperação sem loop infinito | limites, backoff e classificação de erros ainda não definidos | testes de erro transitório, permanente, exaustão e observabilidade |
 | Referência pendente | processar mensagens fora de ordem sem perda | TTL ou máximo de tentativas ainda não definidos | referência posterior, expiração e rejeição terminal auditável |
 | Taxonomia de falhas | clientes e workers agirem sem analisar texto | códigos de validação, conflito, negócio e infraestrutura | testes de mapeamento estável em HTTP e SQS |
-| Cursor do ledger | paginação estável e determinística | composição e codificação opaca do cursor | empates, inserções concorrentes e continuidade sem duplicação |
 | Autenticação | ponto de extensão sem competir com garantias financeiras | IdP externo ou adiamento documentado com porta/guard explícito | integração do IdP ou teste do ponto de extensão; health permanece público |
 | Shutdown de workers | não perder trabalho em andamento | drenagem, extensão/devolução de visibility timeout e ordem de encerramento | `SIGTERM` durante consumo e publicação |
 | Observabilidade | diagnosticar rejeições, retries, DLQ e divergências | formato de logs, correlação e métricas ainda não definidos | testes que confirmem sinais úteis sem expor dados sensíveis |
@@ -316,11 +328,11 @@ bun run migration:up
 bun run migration:down
 ```
 
-O ciclo `up → inspeção → down → inspeção → up` agora é automatizado em um banco temporário criado por execução. A suíte PostgreSQL também comprova round-trip exato dos cinco modelos, commit, rollback após SQL efetivamente executado, constraints representativas e imutabilidade do ledger. A inspeção inicial permanece como evidência ampliada de 22 violações e dos planos dos três índices com dados representativos. Os testes de concorrência e de SQS serão adicionados nas fases correspondentes; a suíte atual também comprova o runner do Bun, a configuração, o comportamento puro do domínio e os contratos de persistência.
+O ciclo `up → inspeção → down → inspeção → up` agora é automatizado em um banco temporário criado por execução. A suíte PostgreSQL também comprova round-trip exato dos cinco modelos, commit, rollback após SQL efetivamente executado, constraints representativas, imutabilidade do ledger e paginação estável com empate de timestamp e inserção entre páginas. A inspeção inicial permanece como evidência ampliada de 22 violações e dos planos dos três índices com dados representativos. Os testes de concorrência financeira e de SQS serão adicionados nas fases correspondentes; a suíte atual também comprova o runner do Bun, a configuração, o comportamento puro do domínio e os contratos de persistência.
 
 ## 10. Limitações atuais
 
-- apenas a criação de wallet possui caso de uso; processamento de apostas, consultas e reconciliação ainda não foram implementados;
+- criação e consultas de wallet e ledger possuem casos de uso; processamento de apostas e reconciliação ainda não foram implementados;
 - não existem endpoints de wallet, wagering ou ledger;
 - não existem consumer, inbox, outbox ou publisher;
 - não existem garantias implementadas de concorrência ou idempotência;

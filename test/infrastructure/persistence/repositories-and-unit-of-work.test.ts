@@ -42,12 +42,21 @@ interface EntityManagerDouble {
     entityType: new (...args: never[]) => object;
     where: object;
   }>;
+  readonly findCalls: Array<{
+    entityType: new (...args: never[]) => object;
+    where: object;
+    options: object;
+  }>;
   readonly persisted: object[];
   readonly assignments: Array<{ entity: object; data: object }>;
 }
 
-function entityManagerDouble(findOneResult: object | null): EntityManagerDouble {
+function entityManagerDouble(
+  findOneResult: object | null,
+  findResult: object[] = [],
+): EntityManagerDouble {
   const findOneCalls: EntityManagerDouble['findOneCalls'] = [];
+  const findCalls: EntityManagerDouble['findCalls'] = [];
   const persisted: object[] = [];
   const assignments: EntityManagerDouble['assignments'] = [];
 
@@ -58,6 +67,14 @@ function entityManagerDouble(findOneResult: object | null): EntityManagerDouble 
     ) {
       findOneCalls.push({ entityType, where });
       return findOneResult;
+    },
+    async find(
+      entityType: new (...args: never[]) => object,
+      where: object,
+      options: object,
+    ) {
+      findCalls.push({ entityType, where, options });
+      return findResult;
     },
     create(
       entityType: new (...args: never[]) => object,
@@ -74,7 +91,7 @@ function entityManagerDouble(findOneResult: object | null): EntityManagerDouble 
     },
   } as unknown as EntityManager;
 
-  return { entityManager, findOneCalls, persisted, assignments };
+  return { entityManager, findOneCalls, findCalls, persisted, assignments };
 }
 
 function brl(amount: string): Money {
@@ -231,7 +248,7 @@ describe('MikroORM repositories', () => {
       new WalletLedgerEntryPersistenceEntity(),
       WalletLedgerEntryPersistenceMapper.toPersistence(domainEntry),
     );
-    const double = entityManagerDouble(persistenceEntity);
+    const double = entityManagerDouble(persistenceEntity, [persistenceEntity]);
     const repository = new MikroOrmWalletLedgerEntryRepository(
       double.entityManager,
     );
@@ -240,12 +257,29 @@ describe('MikroORM repositories', () => {
       WALLET_ID,
       TRANSACTION_ID,
     );
+    const before = new Date('2026-10-08T12:10:00.000Z');
+    const page = await repository.listByWallet(WALLET_ID, {
+      before: { createdAt: before, id: domainEntry.id },
+      limit: 51,
+    });
     await repository.add(domainEntry);
 
     expect(loaded?.isBalanced()).toBe(true);
     expect(double.findOneCalls[0]?.where).toEqual({
       walletId: WALLET_ID,
       transactionId: TRANSACTION_ID,
+    });
+    expect(page[0]?.id).toBe(domainEntry.id);
+    expect(double.findCalls[0]?.where).toEqual({
+      walletId: WALLET_ID,
+      $or: [
+        { createdAt: { $lt: before } },
+        { createdAt: before, id: { $lt: domainEntry.id } },
+      ],
+    });
+    expect(double.findCalls[0]?.options).toEqual({
+      limit: 51,
+      orderBy: { createdAt: 'DESC', id: 'DESC' },
     });
     expect(double.persisted[0]).toBeInstanceOf(
       WalletLedgerEntryPersistenceEntity,

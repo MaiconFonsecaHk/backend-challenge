@@ -40,7 +40,21 @@ export interface WalletLedgerEntryRepository {
     walletId: string,
     transactionId: string,
   ): Promise<WalletLedgerEntry | undefined>;
+  listByWallet(
+    walletId: string,
+    query: WalletLedgerPageQuery,
+  ): Promise<readonly WalletLedgerEntry[]>;
   add(entry: WalletLedgerEntry): Promise<void>;
+}
+
+export interface WalletLedgerPagePosition {
+  readonly createdAt: Date;
+  readonly id: string;
+}
+
+export interface WalletLedgerPageQuery {
+  readonly before?: WalletLedgerPagePosition;
+  readonly limit: number;
 }
 
 export interface InboxMessageRepository {

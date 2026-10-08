@@ -5,6 +5,8 @@ import { MikroORM } from '@mikro-orm/postgresql';
 import type { Clock } from '../../../src/application/ports/clock.js';
 import type { IdGenerator } from '../../../src/application/ports/id-generator.js';
 import { CreateWalletUseCase } from '../../../src/application/use-cases/wallet/create-wallet.use-case.js';
+import { GetWalletLedgerUseCase } from '../../../src/application/use-cases/wallet/get-wallet-ledger.use-case.js';
+import { GetWalletUseCase } from '../../../src/application/use-cases/wallet/get-wallet.use-case.js';
 import { databaseEnvironmentSchema } from '../../../src/config/environment.schema.js';
 import { LedgerDirection } from '../../../src/domain/ledger/ledger-direction.js';
 import { WalletLedgerEntry } from '../../../src/domain/ledger/wallet-ledger-entry.js';
@@ -23,6 +25,7 @@ import { Migration20261008015154_create_persistence_tables } from '../../../src/
 import { Migration20261008021520_enforce_persistence_constraints } from '../../../src/infrastructure/persistence/migrations/Migration20261008021520_enforce_persistence_constraints.js';
 import { Migration20261008023045_add_access_pattern_indexes } from '../../../src/infrastructure/persistence/migrations/Migration20261008023045_add_access_pattern_indexes.js';
 import { MikroOrmUnitOfWork } from '../../../src/infrastructure/persistence/mikro-orm.unit-of-work.js';
+import { Base64UrlLedgerCursorCodec } from '../../../src/infrastructure/serialization/base64url-ledger-cursor.codec.js';
 
 const APPLICATION_TABLES = [
   'inbox_messages',
@@ -467,6 +470,118 @@ describePostgreSql('PostgreSQL schema integration', () => {
         [walletId],
       );
     expect(reconciliation?.reconciled).toBe(true);
+  });
+
+  test('queries wallets and paginates equal-timestamp ledger entries without drift', async () => {
+    const walletId = '10000000-0000-4000-8000-000000000107';
+    const playerId = '20000000-0000-4000-8000-000000000107';
+    const unitOfWork = new MikroOrmUnitOfWork(requiredApplicationOrm());
+    const ledgerCreatedAt = new Date('2026-10-08T13:00:00.000Z');
+
+    await unitOfWork.execute(async (repositories) => {
+      await repositories.wallets.add(
+        Wallet.open({
+          id: walletId,
+          playerId,
+          initialBalance: money('0.00'),
+          openedAt: CREATED_AT,
+        }),
+      );
+    });
+
+    const persistCredit = async (sequence: number, createdAt: Date) => {
+      const suffix = sequence.toString().padStart(12, '0');
+      const transactionId = `30000000-0000-4000-8000-${suffix}`;
+      const ledgerId = `40000000-0000-4000-8000-${suffix}`;
+
+      await unitOfWork.execute(async (repositories) => {
+        const wallet = await repositories.wallets.findById(walletId);
+        if (wallet === undefined) {
+          throw new Error('Ledger query fixture wallet was not persisted');
+        }
+
+        const transaction = WagerTransaction.create({
+          id: transactionId,
+          providerId: 'ledger-query-probe',
+          externalTransactionId: `ledger-query-${sequence}`,
+          idempotencyKey: `ledger-query-probe:${sequence}`,
+          payloadHash: `ledger-query-payload-${sequence}`,
+          walletId,
+          playerId,
+          roundId: `ledger-query-round-${sequence}`,
+          gameId: 'ledger-query-game',
+          kind: WagerTransactionKind.Win,
+          money: money('10.00'),
+          createdAt,
+        });
+        const change = wallet.credit(money('10.00'), createdAt);
+        transaction.markProcessed(undefined, createdAt);
+
+        await repositories.wagerTransactions.add({
+          transaction,
+          resultBalance: change.balanceAfter,
+          referenceAttempts: 0,
+        });
+        await repositories.walletLedgerEntries.add(
+          WalletLedgerEntry.create({
+            id: ledgerId,
+            walletId,
+            transactionId,
+            direction: change.direction,
+            money: change.money,
+            balanceBefore: change.balanceBefore,
+            balanceAfter: change.balanceAfter,
+            createdAt,
+          }),
+        );
+        await repositories.wallets.save(wallet);
+      });
+
+      return ledgerId;
+    };
+
+    const firstLedgerId = await persistCredit(201, ledgerCreatedAt);
+    const secondLedgerId = await persistCredit(202, ledgerCreatedAt);
+    const thirdLedgerId = await persistCredit(203, ledgerCreatedAt);
+    const cursorCodec = new Base64UrlLedgerCursorCodec();
+    const ledgerQuery = new GetWalletLedgerUseCase(unitOfWork, cursorCodec);
+
+    const firstPage = await ledgerQuery.execute({ walletId, limit: 2 });
+
+    expect(firstPage.items.map((item) => item.id)).toEqual([
+      thirdLedgerId,
+      secondLedgerId,
+    ]);
+    expect(firstPage.nextCursor).toBeDefined();
+    const firstPageCursor = firstPage.nextCursor;
+    if (firstPageCursor === undefined) {
+      throw new Error('First ledger page did not provide a continuation cursor');
+    }
+
+    const newestLedgerId = await persistCredit(
+      204,
+      new Date('2026-10-08T13:01:00.000Z'),
+    );
+    const secondPage = await ledgerQuery.execute({
+      walletId,
+      cursor: firstPageCursor,
+      limit: 2,
+    });
+    const freshFirstPage = await ledgerQuery.execute({ walletId, limit: 2 });
+    const wallet = await new GetWalletUseCase(unitOfWork).execute(walletId);
+
+    expect(secondPage.items.map((item) => item.id)).toEqual([firstLedgerId]);
+    expect(secondPage.nextCursor).toBeUndefined();
+    expect(freshFirstPage.items.map((item) => item.id)).toEqual([
+      newestLedgerId,
+      thirdLedgerId,
+    ]);
+    expect(wallet).toEqual({
+      id: walletId,
+      playerId,
+      balance: { amount: '40.00', currency: 'BRL' },
+      version: 5,
+    });
   });
 
   test('rolls back every wallet-opening effect when its transaction cannot persist', async () => {

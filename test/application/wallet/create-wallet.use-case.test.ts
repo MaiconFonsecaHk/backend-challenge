@@ -90,6 +90,7 @@ function persistenceDouble(existingWallet?: Wallet): {
     },
     walletLedgerEntries: {
       findByWalletAndTransaction: async () => undefined,
+      listByWallet: async () => [],
       add: async (entry) => {
         capture.ledgerEntries.push(entry);
       },
