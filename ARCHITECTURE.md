@@ -98,13 +98,14 @@ O domínio não pode importar NestJS, MikroORM, AWS SDK ou tipos de transporte. 
 
 ### D-005 — Migrations explícitas, transacionais e reversíveis
 
-- **Status:** confirmada para a infraestrutura de migrations.
+- **Status:** confirmada para a infraestrutura e para a criação das cinco tabelas persistentes.
 - **Requisito protegido:** evolução reproduzível e reversível do schema.
 - **Alternativas consideradas:** sincronização automática do schema e alterações manuais foram rejeitadas.
-- **Trade-off:** toda alteração exige migration revisada e um caminho `down`; alterações destrutivas precisarão de análise adicional.
-- **Evidência:** baseline neutro aplicado, revertido e reaplicado em banco temporário limpo, com verificação da tabela de controle do MikroORM.
+- **Trade-off:** toda alteração exige migration revisada, snapshot coerente e um caminho `down`; alterações destrutivas precisarão de análise adicional. O snapshot possui nome estável e independe do nome do banco usado localmente ou em testes.
+- **Escolha:** a migration de schema foi gerada pela CLI do MikroORM a partir do registro explícito de entidades. Ela cria `wallets`, `wager_transactions`, `wallet_ledger_entries`, `inbox_messages` e `outbox_messages`, incluindo chaves primárias, relações já modeladas e os valores enumerados conhecidos. O `down` remove somente esse schema, preservando o baseline e o controle de migrations.
+- **Evidência:** em um banco PostgreSQL temporário e isolado, `migration:up` aplicou baseline e schema desde zero; a inspeção do catálogo confirmou exatamente as cinco tabelas; `migration:down` removeu todas elas; uma nova execução de `migration:up` as recriou; a comparação final entre banco, snapshot e metadados informou que não havia drift.
 
-O baseline atual não cria tabelas de domínio. Sua função é provar a cadeia de migrations antes da modelagem financeira; migrations de negócio devem conter DDL e reversões reais.
+O baseline permanece neutro e prova a cadeia inicial. A migration seguinte contém o DDL real das tabelas. Constraints financeiras adicionais, índices e proteção de imutabilidade do ledger continuam em blocos próprios e não são considerados concluídos pela simples criação das tabelas.
 
 ### D-006 — Liveness separado de readiness
 
@@ -254,13 +255,12 @@ bun run migration:up
 bun run migration:down
 ```
 
-O ciclo de migration deve ser comprovado em banco descartável antes de alterações reais de schema. Testes de integração e concorrência serão adicionados nas fases correspondentes; os testes atuais comprovam o runner do Bun, a normalização básica da configuração, o comportamento puro da Fase 2 e a descoberta dos cinco modelos persistentes com seus tipos e relações.
+O ciclo `up → inspeção → down → inspeção → up` foi comprovado em banco PostgreSQL temporário, seguido por uma comparação sem drift entre banco, snapshot e metadados. Testes automatizados de integração e concorrência serão adicionados nas fases correspondentes; os testes atuais também comprovam o runner do Bun, a normalização básica da configuração, o comportamento puro da Fase 2 e a descoberta dos cinco modelos persistentes com seus tipos e relações.
 
 ## 10. Limitações atuais
 
 - os modelos puros da Fase 2 ainda não possuem casos de uso, mappers nem repositórios;
-- os modelos do MikroORM existem, mas ainda não há migration que materialize as tabelas de negócio;
-- não existem tabelas de negócio ou constraints financeiras;
+- a migration materializa as cinco tabelas, mas ainda faltam constraints financeiras obrigatórias, índices orientados aos acessos e proteção de imutabilidade do ledger;
 - não existem endpoints de wallet, wagering ou ledger;
 - não existem consumer, inbox, outbox ou publisher;
 - não existem garantias implementadas de concorrência ou idempotência;

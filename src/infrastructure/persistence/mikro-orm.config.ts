@@ -17,6 +17,7 @@ export default defineConfig({
     path: './dist/infrastructure/persistence/migrations',
     pathTs: './src/infrastructure/persistence/migrations',
     snapshot: true,
+    snapshotName: '.snapshot-backend-challenge',
     snapshotOnMigrate: false,
     transactional: true,
   },
