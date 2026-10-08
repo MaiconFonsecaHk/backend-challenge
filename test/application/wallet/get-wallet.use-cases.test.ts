@@ -69,6 +69,7 @@ function queryContext(options: {
   const repositories = {
     wallets: {
       findById: async () => options.existingWallet,
+      findByIdForUpdate: async () => options.existingWallet,
       findByPlayerAndCurrency: async () => undefined,
       add: async () => undefined,
       save: async () => undefined,

@@ -109,6 +109,7 @@ class ConcurrentLossExecutor implements NewWagerTransactionExecutor {
 
   async execute(
     command: WagerTransactionProcessingCommand,
+    wallet: Wallet,
     repositories: PersistenceRepositories,
   ): Promise<WagerTransactionRecord> {
     this.executions += 1;
@@ -118,11 +119,6 @@ class ConcurrentLossExecutor implements NewWagerTransactionExecutor {
         this.releaseBarrier?.();
       }
       await this.barrier;
-    }
-
-    const wallet = await repositories.wallets.findById(command.walletId);
-    if (wallet === undefined) {
-      throw new Error('Idempotency integration wallet was not persisted');
     }
 
     const transaction = WagerTransaction.create({
@@ -208,6 +204,24 @@ function requiredAdministrationOrm(): MikroORM {
   }
 
   return administrationOrm;
+}
+
+async function createIndependentApplicationOrm(
+  log: string[],
+): Promise<MikroORM> {
+  const environment = testEnvironment();
+
+  return MikroORM.init({
+    dbName: databaseName,
+    debug: ['query'],
+    entities: [...PERSISTENCE_ENTITIES],
+    host: environment.POSTGRES_HOST,
+    logger: (message) => log.push(message),
+    password: environment.POSTGRES_PASSWORD,
+    pool: { max: 1, min: 0 },
+    port: environment.POSTGRES_PORT,
+    user: environment.POSTGRES_USER,
+  });
 }
 
 function money(amount: string): Money {
@@ -731,6 +745,111 @@ describePostgreSql('PostgreSQL schema integration', () => {
       consistent: true,
       checkedEntries: 0,
     });
+  });
+
+  test('serializes one wallet across three instances while distinct wallets stay parallel', async () => {
+    const firstWalletId = '10000000-0000-4000-8000-000000000110';
+    const firstPlayerId = '20000000-0000-4000-8000-000000000110';
+    const secondWalletId = '10000000-0000-4000-8000-000000000111';
+    const secondPlayerId = '20000000-0000-4000-8000-000000000111';
+    const unitOfWork = new MikroOrmUnitOfWork(requiredApplicationOrm());
+    await new CreateWalletUseCase(
+      unitOfWork,
+      new SequenceIdGenerator([firstWalletId]),
+      new FixedClock(CREATED_AT),
+    ).execute({
+      playerId: firstPlayerId,
+      initialBalance: { amount: '0.00', currency: 'BRL' },
+      correlationId: 'wallet-lock-integration-110',
+    });
+    await new CreateWalletUseCase(
+      unitOfWork,
+      new SequenceIdGenerator([secondWalletId]),
+      new FixedClock(CREATED_AT),
+    ).execute({
+      playerId: secondPlayerId,
+      initialBalance: { amount: '0.00', currency: 'BRL' },
+      correlationId: 'wallet-lock-integration-111',
+    });
+
+    const independentQueryLog: string[] = [];
+    const instances = await Promise.all(
+      Array.from({ length: 3 }, () =>
+        createIndependentApplicationOrm(independentQueryLog),
+      ),
+    );
+
+    try {
+      let activeSameWallet = 0;
+      let maxActiveSameWallet = 0;
+      await Promise.all(
+        instances.map((orm) =>
+          new MikroOrmUnitOfWork(orm).execute(async (repositories) => {
+            const locked = await repositories.wallets.findByIdForUpdate(
+              firstWalletId,
+            );
+            if (locked === undefined) {
+              throw new Error('Wallet lock probe could not find its wallet');
+            }
+
+            activeSameWallet += 1;
+            maxActiveSameWallet = Math.max(
+              maxActiveSameWallet,
+              activeSameWallet,
+            );
+            await new Promise((resolve) => setTimeout(resolve, 30));
+            activeSameWallet -= 1;
+          }),
+        ),
+      );
+      expect(maxActiveSameWallet).toBe(1);
+
+      let releaseDistinctWallets: (() => void) | undefined;
+      const distinctWalletBarrier = new Promise<void>((resolve) => {
+        releaseDistinctWallets = resolve;
+      });
+      let distinctWalletArrivals = 0;
+      let activeDistinctWallets = 0;
+      let maxActiveDistinctWallets = 0;
+      const lockDistinctWallet = async (orm: MikroORM, walletId: string) =>
+        new MikroOrmUnitOfWork(orm).execute(async (repositories) => {
+          const locked = await repositories.wallets.findByIdForUpdate(walletId);
+          if (locked === undefined) {
+            throw new Error('Distinct wallet lock probe could not find its wallet');
+          }
+
+          activeDistinctWallets += 1;
+          maxActiveDistinctWallets = Math.max(
+            maxActiveDistinctWallets,
+            activeDistinctWallets,
+          );
+          distinctWalletArrivals += 1;
+          if (distinctWalletArrivals === 2) {
+            releaseDistinctWallets?.();
+          }
+          await distinctWalletBarrier;
+          activeDistinctWallets -= 1;
+        });
+
+      const firstInstance = instances[0];
+      const secondInstance = instances[1];
+      if (firstInstance === undefined || secondInstance === undefined) {
+        throw new Error('Three independent ORM instances were not created');
+      }
+      await Promise.all([
+        lockDistinctWallet(firstInstance, firstWalletId),
+        lockDistinctWallet(secondInstance, secondWalletId),
+      ]);
+
+      expect(maxActiveDistinctWallets).toBe(2);
+      expect(
+        independentQueryLog.filter((message) =>
+          message.toLowerCase().includes('for update'),
+        ).length,
+      ).toBeGreaterThanOrEqual(5);
+    } finally {
+      await Promise.all(instances.map((orm) => orm.close(true)));
+    }
   });
 
   test('deduplicates 50 concurrent submissions and preserves the committed result', async () => {

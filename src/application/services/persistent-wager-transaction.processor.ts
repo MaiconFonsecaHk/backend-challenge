@@ -1,4 +1,5 @@
 import { IdempotencyConflictError } from '../errors/wager-application.error.js';
+import { WalletNotFoundError } from '../errors/wallet-application.error.js';
 import type { PersistenceConflictClassifier } from '../ports/persistence/persistence-conflict-classifier.js';
 import type { WagerTransactionRecord } from '../ports/persistence/repositories.js';
 import type { UnitOfWork } from '../ports/persistence/unit-of-work.js';
@@ -8,6 +9,7 @@ import type {
   WagerTransactionProcessingCommand,
   WagerTransactionProcessor,
 } from '../ports/wager-transaction-processor.js';
+import { WagerTransactionKind } from '../../domain/wagering/wager-transaction.js';
 
 export class PersistentWagerTransactionProcessor
   implements WagerTransactionProcessor
@@ -31,8 +33,17 @@ export class PersistentWagerTransactionProcessor
           return this.resolveExisting(existing, command);
         }
 
+        const wallet =
+          command.kind === WagerTransactionKind.Loss
+            ? await repositories.wallets.findById(command.walletId)
+            : await repositories.wallets.findByIdForUpdate(command.walletId);
+        if (wallet === undefined) {
+          throw new WalletNotFoundError(command.walletId);
+        }
+
         const created = await this.newTransactionExecutor.execute(
           command,
+          wallet,
           repositories,
         );
         PersistentWagerTransactionProcessor.assertExecutionMatchesCommand(

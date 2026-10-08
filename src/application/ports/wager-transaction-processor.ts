@@ -7,6 +7,7 @@ import type {
   WagerTransactionKind,
   WagerTransactionStatus,
 } from '../../domain/wagering/wager-transaction.js';
+import type { Wallet } from '../../domain/wallet/wallet.js';
 
 export const WAGER_TRANSACTION_PROCESSOR = Symbol(
   'WAGER_TRANSACTION_PROCESSOR',
@@ -53,6 +54,7 @@ export interface WagerTransactionProcessor {
 export interface NewWagerTransactionExecutor {
   execute(
     command: WagerTransactionProcessingCommand,
+    wallet: Wallet,
     repositories: PersistenceRepositories,
   ): Promise<WagerTransactionRecord>;
 }

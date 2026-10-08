@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { LockMode } from '@mikro-orm/core';
 import type { EntityManager, MikroORM } from '@mikro-orm/postgresql';
 
 import type { WagerTransactionRecord } from '../../../src/application/ports/persistence/repositories.js';
@@ -42,6 +43,7 @@ interface EntityManagerDouble {
   readonly findOneCalls: Array<{
     entityType: new (...args: never[]) => object;
     where: object;
+    options?: object;
   }>;
   readonly findCalls: Array<{
     entityType: new (...args: never[]) => object;
@@ -65,8 +67,9 @@ function entityManagerDouble(
     async findOne(
       entityType: new (...args: never[]) => object,
       where: object,
+      options?: object,
     ) {
-      findOneCalls.push({ entityType, where });
+      findOneCalls.push({ entityType, where, options });
       return findOneResult;
     },
     async find(
@@ -180,6 +183,7 @@ describe('MikroORM repositories', () => {
     const repository = new MikroOrmWalletRepository(double.entityManager);
 
     const loadedById = await repository.findById(WALLET_ID);
+    const lockedById = await repository.findByIdForUpdate(WALLET_ID);
     const loadedByOwner = await repository.findByPlayerAndCurrency(
       PLAYER_ID,
       'BRL',
@@ -189,12 +193,17 @@ describe('MikroORM repositories', () => {
     await repository.save(domainWallet);
 
     expect(loadedById?.balance.toJSON().amount).toBe('100.00');
+    expect(lockedById?.balance.toJSON().amount).toBe('100.00');
     expect(loadedByOwner?.playerId).toBe(PLAYER_ID);
     expect(double.findOneCalls.map((call) => call.where)).toEqual([
+      { id: WALLET_ID },
       { id: WALLET_ID },
       { playerId: PLAYER_ID, currency: 'BRL' },
       { id: WALLET_ID },
     ]);
+    expect(double.findOneCalls[1]?.options).toEqual({
+      lockMode: LockMode.PESSIMISTIC_WRITE,
+    });
     expect(double.persisted[0]).toBeInstanceOf(WalletPersistenceEntity);
     expect(double.assignments[0]?.data).toEqual({
       balance: '75.00',

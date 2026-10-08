@@ -73,6 +73,7 @@ function persistenceDouble(existingWallet?: Wallet): {
   const repositories: PersistenceRepositories = {
     wallets: {
       findById: async () => undefined,
+      findByIdForUpdate: async () => undefined,
       findByPlayerAndCurrency: async () => existingWallet,
       add: async (wallet) => {
         capture.wallets.push(wallet);

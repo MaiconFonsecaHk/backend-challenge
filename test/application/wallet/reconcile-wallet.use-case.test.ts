@@ -26,6 +26,7 @@ function reconciliationContext(snapshot?: WalletReconciliationSnapshot): {
   const repositories = {
     wallets: {
       findById: async () => undefined,
+      findByIdForUpdate: async () => undefined,
       findByPlayerAndCurrency: async () => undefined,
       add: unexpectedWrite,
       save: unexpectedWrite,

@@ -21,6 +21,7 @@ import {
   WagerTransactionKind,
   WagerTransactionStatus,
 } from '../../../src/domain/wagering/wager-transaction.js';
+import { Wallet } from '../../../src/domain/wallet/wallet.js';
 
 const CREATED_AT = new Date('2026-10-08T18:00:00.000Z');
 const PROCESSED_AT = new Date('2026-10-08T18:00:01.000Z');
@@ -81,6 +82,15 @@ function transactionRecord(
   };
 }
 
+function wallet(): Wallet {
+  return Wallet.open({
+    id: command().walletId,
+    playerId: command().playerId,
+    initialBalance: Money.from({ amount: '100.00', currency: 'BRL' }),
+    openedAt: CREATED_AT,
+  });
+}
+
 class WagerRepositoryDouble {
   readonly added: WagerTransactionRecord[] = [];
 
@@ -95,9 +105,30 @@ class WagerRepositoryDouble {
   }
 }
 
-function repositories(wagers: WagerRepositoryDouble): PersistenceRepositories {
+class WalletRepositoryDouble {
+  readonly findByIdCalls: string[] = [];
+  readonly findByIdForUpdateCalls: string[] = [];
+
+  constructor(private readonly result: Wallet | null = wallet()) {}
+
+  async findById(id: string): Promise<Wallet | undefined> {
+    this.findByIdCalls.push(id);
+    return this.result ?? undefined;
+  }
+
+  async findByIdForUpdate(id: string): Promise<Wallet | undefined> {
+    this.findByIdForUpdateCalls.push(id);
+    return this.result ?? undefined;
+  }
+}
+
+function repositories(
+  wagers: WagerRepositoryDouble,
+  wallets = new WalletRepositoryDouble(),
+): PersistenceRepositories {
   return {
     wagerTransactions: wagers,
+    wallets,
   } as unknown as PersistenceRepositories;
 }
 
@@ -124,13 +155,16 @@ class UnitOfWorkDouble implements UnitOfWork {
 
 class ExecutorDouble implements NewWagerTransactionExecutor {
   readonly commands: WagerTransactionProcessingCommand[] = [];
+  readonly wallets: Wallet[] = [];
 
   constructor(private readonly record: WagerTransactionRecord) {}
 
   async execute(
     processingCommand: WagerTransactionProcessingCommand,
+    lockedWallet: Wallet,
   ): Promise<WagerTransactionRecord> {
     this.commands.push(processingCommand);
+    this.wallets.push(lockedWallet);
     return this.record;
   }
 }
@@ -147,9 +181,10 @@ describe('PersistentWagerTransactionProcessor', () => {
   test('persists a new execution and returns its original immutable result', async () => {
     const created = transactionRecord({}, { resultBalance: Money.from({ amount: '75.00', currency: 'BRL' }) });
     const wagers = new WagerRepositoryDouble([undefined]);
+    const wallets = new WalletRepositoryDouble();
     const executor = new ExecutorDouble(created);
     const processor = new PersistentWagerTransactionProcessor(
-      new UnitOfWorkDouble(repositories(wagers)),
+      new UnitOfWorkDouble(repositories(wagers, wallets)),
       executor,
       new ConflictClassifierDouble(undefined),
     );
@@ -157,6 +192,9 @@ describe('PersistentWagerTransactionProcessor', () => {
     const result = await processor.process(command());
 
     expect(executor.commands).toEqual([command()]);
+    expect(executor.wallets).toHaveLength(1);
+    expect(wallets.findByIdCalls).toEqual([command().walletId]);
+    expect(wallets.findByIdForUpdateCalls).toEqual([]);
     expect(wagers.added).toEqual([created]);
     expect(result).toEqual({
       transactionId: TRANSACTION_ID,
@@ -166,6 +204,46 @@ describe('PersistentWagerTransactionProcessor', () => {
     });
     expect(Object.isFrozen(result)).toBe(true);
     expect(Object.isFrozen(result.balance)).toBe(true);
+  });
+
+  test('acquires an exclusive wallet row lock before balance-changing execution', async () => {
+    const processingCommand = command({ kind: WagerTransactionKind.Bet });
+    const wallets = new WalletRepositoryDouble();
+    const executor = new ExecutorDouble(
+      transactionRecord({ kind: WagerTransactionKind.Bet }),
+    );
+    const processor = new PersistentWagerTransactionProcessor(
+      new UnitOfWorkDouble(
+        repositories(new WagerRepositoryDouble([undefined]), wallets),
+      ),
+      executor,
+      new ConflictClassifierDouble(undefined),
+    );
+
+    await processor.process(processingCommand);
+
+    expect(wallets.findByIdCalls).toEqual([]);
+    expect(wallets.findByIdForUpdateCalls).toEqual([command().walletId]);
+    expect(executor.wallets).toHaveLength(1);
+  });
+
+  test('does not execute when the target wallet does not exist', async () => {
+    const executor = new ExecutorDouble(transactionRecord());
+    const processor = new PersistentWagerTransactionProcessor(
+      new UnitOfWorkDouble(
+        repositories(
+          new WagerRepositoryDouble([undefined]),
+          new WalletRepositoryDouble(null),
+        ),
+      ),
+      executor,
+      new ConflictClassifierDouble(undefined),
+    );
+
+    await expect(processor.process(command())).rejects.toMatchObject({
+      code: 'WALLET_NOT_FOUND',
+    });
+    expect(executor.commands).toEqual([]);
   });
 
   test('returns a stored identical result without executing or persisting again', async () => {
