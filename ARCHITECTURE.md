@@ -52,7 +52,7 @@ AppModule
     └── SQS health indicator ── AWS SDK v3 ── MiniStack/SQS
 ```
 
-Ainda não existem endpoints financeiros, consumidor SQS ou workers. O domínio puro da Fase 2 contém `Money`, `Wallet`, `WagerTransaction`, `WalletLedgerEntry`, os modelos de inbox/outbox e os eventos de integração. A infraestrutura materializa os cinco modelos persistentes com constraints, índices, mappers, repositórios e Unit of Work transacional. A aplicação possui os casos de uso de criação, consulta e reconciliação de wallet e de consulta paginada do ledger; os demais casos de uso continuam nas etapas específicas do roadmap.
+Ainda não existem endpoints financeiros, consumidor SQS ou workers. O domínio puro da Fase 2 contém `Money`, `Wallet`, `WagerTransaction`, `WalletLedgerEntry`, os modelos de inbox/outbox e os eventos de integração. A infraestrutura materializa os cinco modelos persistentes com constraints, índices, mappers, repositórios e Unit of Work transacional. A aplicação possui os casos de uso de criação, consulta e reconciliação de wallet, consulta paginada do ledger e uma entrada única e independente de transporte para submissões de wagering. O processador financeiro concreto dessa entrada continua desacoplado até que hash, idempotência e concorrência sejam implementados com suas provas próprias.
 
 ## 4. Boundaries e dependências
 
@@ -285,6 +285,16 @@ O baseline permanece neutro e prova a cadeia inicial. A migration seguinte cont�
 - **Evidência:** testes unitários cobrem saldo consistente acima do limite seguro do JavaScript, diferença negativa, wallet vazia, ausência da wallet, DTOs congelados, SQL agregado único e rejeição de contagem inexata. No PostgreSQL real, quatro créditos produzem saldo calculado `40.00`; após uma alteração intencional do saldo materializado para `41.00`, a resposta informa diferença `1.00`, `consistent: false` e quatro entradas, nenhuma instrução de correção é emitida e a wallet permanece em `41.00`.
 - **Limitação e gatilho de revisão:** o endpoint ainda deverá registrar log estruturado e incrementar métrica quando `consistent` for falso. Essas integrações serão ligadas na borda sem conceder ao caso de uso capacidade de corrigir dados; volumes que tornem a agregação integral lenta exigirão medição antes de qualquer resumo materializado ou estratégia incremental.
 
+### D-022 — HTTP e SQS compartilham uma única entrada de wagering
+
+- **Status:** confirmada para o contrato de aplicação e sua validação comum; o processador financeiro concreto permanece deliberadamente não ligado até os próximos blocos da Fase 5.
+- **Requisito protegido:** submissões HTTP e mensagens SQS devem alcançar exatamente o mesmo fluxo de negócio, bloquear `OPENING` externo e produzir a mesma semântica sem duplicar validação ou regras em adapters de transporte.
+- **Alternativas consideradas:** criar handlers financeiros separados para HTTP e SQS foi rejeitado porque permitiria divergência de regras, idempotência e respostas; transportar DTOs ou decorators do NestJS para a aplicação foi rejeitado por acoplamento; acessar repositórios diretamente nos adapters foi rejeitado porque permitiria contornar o limite transacional e as futuras garantias de concorrência.
+- **Escolha:** `ProcessWagerTransactionUseCase` recebe somente dados de negócio, `Idempotency-Key` e correlação, sem campos de HTTP, SQS, NestJS ou AWS. A fronteira valida identidades obrigatórias, tipos externos permitidos, formato das referências e `Money`, normaliza o decimal e entrega um comando profundamente imutável a `WagerTransactionProcessor`. A resposta comum contém identidade interna, status, saldo opcional, falha opcional e `idempotentReplay`; o use case copia e congela o resultado antes de devolvê-lo ao adapter.
+- **Trade-off:** a porta do processador mantém a entrada única testável sem criar uma implementação financeira parcialmente segura. Em contrapartida, o use case ainda não é registrado no NestJS nem executa persistência: só será ligado quando a implementação da porta incluir hash canônico, idempotência persistente, locking por wallet e todos os efeitos atômicos. `messageId` e identidade da inbox ficam no consumidor da Fase 7 e não contaminam o comando financeiro compartilhado.
+- **Evidência:** testes unitários confirmam normalização monetária exata, imutabilidade do comando e da resposta, delegação única, bloqueio de `OPENING` e tipos desconhecidos, identidades vazias, referências obrigatórias/proibidas, `WIN` opcionalmente referenciado, valores inválidos e quantias não positivas. Todos os caminhos inválidos falham antes de invocar o processador.
+- **Limitação e gatilho de revisão:** a existência desta fronteira não é evidência de idempotência, concorrência ou processamento financeiro. Essas garantias continuam abertas, o provider não é exposto pelo bootstrap e nenhum adapter pode utilizá-lo até a porta possuir implementação real e testes PostgreSQL concorrentes.
+
 ## 6. Decisões abertas
 
 Nenhuma alternativa desta tabela está escolhida antecipadamente.
@@ -343,7 +353,7 @@ O ciclo `up → inspeção → down → inspeção → up` agora é automatizado
 
 ## 10. Limitações atuais
 
-- criação, consultas e reconciliação de wallet e ledger possuem casos de uso; processamento de apostas ainda não foi implementado;
+- criação, consultas e reconciliação de wallet e ledger possuem casos de uso; wagering possui uma entrada unificada validada, mas o processador financeiro ainda não foi implementado nem ligado ao bootstrap;
 - não existem endpoints de wallet, wagering ou ledger;
 - não existem consumer, inbox, outbox ou publisher;
 - não existem garantias implementadas de concorrência ou idempotência;
