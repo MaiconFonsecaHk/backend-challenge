@@ -4,11 +4,13 @@ import {
   ExternalOpeningNotAllowedError,
   InvalidWagerCommandError,
 } from '../../../src/application/errors/wager-application.error.js';
+import type { PayloadDigest } from '../../../src/application/ports/payload-digest.js';
 import type {
-  NormalizedWagerTransactionCommand,
   ProcessWagerTransactionResult,
   WagerTransactionProcessor,
+  WagerTransactionProcessingCommand,
 } from '../../../src/application/ports/wager-transaction-processor.js';
+import { WagerPayloadFingerprintService } from '../../../src/application/services/wager-payload-fingerprint.js';
 import {
   type ProcessWagerTransactionCommand,
   ProcessWagerTransactionUseCase,
@@ -40,16 +42,41 @@ function command(
 }
 
 class ProcessorDouble implements WagerTransactionProcessor {
-  readonly commands: NormalizedWagerTransactionCommand[] = [];
+  readonly commands: WagerTransactionProcessingCommand[] = [];
 
   constructor(private readonly result: ProcessWagerTransactionResult) {}
 
   async process(
-    normalized: NormalizedWagerTransactionCommand,
+    normalized: WagerTransactionProcessingCommand,
   ): Promise<ProcessWagerTransactionResult> {
     this.commands.push(normalized);
     return this.result;
   }
+}
+
+class PayloadDigestDouble implements PayloadDigest {
+  readonly canonicalPayloads: string[] = [];
+
+  digest(canonicalJson: string): string {
+    this.canonicalPayloads.push(canonicalJson);
+
+    return 'payload-digest';
+  }
+}
+
+function createUseCase(processor: WagerTransactionProcessor): {
+  readonly useCase: ProcessWagerTransactionUseCase;
+  readonly digest: PayloadDigestDouble;
+} {
+  const digest = new PayloadDigestDouble();
+
+  return {
+    useCase: new ProcessWagerTransactionUseCase(
+      processor,
+      new WagerPayloadFingerprintService(digest),
+    ),
+    digest,
+  };
 }
 
 function processedResult(): ProcessWagerTransactionResult {
@@ -64,7 +91,7 @@ function processedResult(): ProcessWagerTransactionResult {
 describe('ProcessWagerTransactionUseCase', () => {
   test('normalizes one transport-neutral command and delegates it once', async () => {
     const processor = new ProcessorDouble(processedResult());
-    const useCase = new ProcessWagerTransactionUseCase(processor);
+    const { useCase, digest } = createUseCase(processor);
 
     const result = await useCase.execute(command());
 
@@ -80,7 +107,11 @@ describe('ProcessWagerTransactionUseCase', () => {
         kind: WagerTransactionKind.Bet,
         money: { amount: '25.00', currency: 'BRL' },
         correlationId: 'correlation-501',
+        payloadHash: 'payload-digest',
       },
+    ]);
+    expect(digest.canonicalPayloads).toEqual([
+      '{"externalTransactionId":"external-501","gameId":"game-501","kind":"BET","money":{"amount":"25.00","currency":"BRL"},"playerId":"20000000-0000-4000-8000-000000000501","providerId":"provider-a","roundId":"round-501","walletId":"10000000-0000-4000-8000-000000000501"}',
     ]);
     expect(Object.isFrozen(processor.commands[0])).toBe(true);
     expect(Object.isFrozen(processor.commands[0]?.money)).toBe(true);
@@ -96,7 +127,7 @@ describe('ProcessWagerTransactionUseCase', () => {
       failureCode: 'INVALID_REFERENCE',
       idempotentReplay: true,
     });
-    const useCase = new ProcessWagerTransactionUseCase(processor);
+    const { useCase } = createUseCase(processor);
 
     const result = await useCase.execute(
       command({
@@ -127,7 +158,7 @@ describe('ProcessWagerTransactionUseCase', () => {
     'correlationId',
   ] as const)('rejects an empty %s before invoking the processor', async (field) => {
     const processor = new ProcessorDouble(processedResult());
-    const useCase = new ProcessWagerTransactionUseCase(processor);
+    const { useCase } = createUseCase(processor);
 
     await expect(
       useCase.execute(command({ [field]: '   ' })),
@@ -137,7 +168,7 @@ describe('ProcessWagerTransactionUseCase', () => {
 
   test('rejects OPENING and unknown transaction kinds at the shared boundary', async () => {
     const processor = new ProcessorDouble(processedResult());
-    const useCase = new ProcessWagerTransactionUseCase(processor);
+    const { useCase } = createUseCase(processor);
 
     await expect(
       useCase.execute(command({ kind: WagerTransactionKind.Opening })),
@@ -160,7 +191,7 @@ describe('ProcessWagerTransactionUseCase', () => {
     'rejects invalid reference shape for %s before invoking the processor',
     async (kind, referenceExternalTransactionId) => {
       const processor = new ProcessorDouble(processedResult());
-      const useCase = new ProcessWagerTransactionUseCase(processor);
+      const { useCase } = createUseCase(processor);
 
       await expect(
         useCase.execute(
@@ -173,7 +204,7 @@ describe('ProcessWagerTransactionUseCase', () => {
 
   test('allows WIN with or without a non-empty reference', async () => {
     const processor = new ProcessorDouble(processedResult());
-    const useCase = new ProcessWagerTransactionUseCase(processor);
+    const { useCase } = createUseCase(processor);
 
     await useCase.execute(command({ kind: WagerTransactionKind.Win }));
     await useCase.execute(
@@ -192,7 +223,7 @@ describe('ProcessWagerTransactionUseCase', () => {
 
   test('reuses exact Money validation before invoking the processor', async () => {
     const processor = new ProcessorDouble(processedResult());
-    const useCase = new ProcessWagerTransactionUseCase(processor);
+    const { useCase } = createUseCase(processor);
 
     await expect(
       useCase.execute(command({ money: { amount: '25.0', currency: 'BRL' } })),
@@ -204,7 +235,7 @@ describe('ProcessWagerTransactionUseCase', () => {
     'rejects non-positive wager amount %s before invoking the processor',
     async (amount) => {
       const processor = new ProcessorDouble(processedResult());
-      const useCase = new ProcessWagerTransactionUseCase(processor);
+      const { useCase } = createUseCase(processor);
 
       await expect(
         useCase.execute(command({ money: { amount, currency: 'BRL' } })),

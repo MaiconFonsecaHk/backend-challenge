@@ -27,6 +27,11 @@ export interface NormalizedWagerTransactionCommand {
   readonly correlationId: string;
 }
 
+export interface WagerTransactionProcessingCommand
+  extends NormalizedWagerTransactionCommand {
+  readonly payloadHash: string;
+}
+
 export interface ProcessWagerTransactionResult {
   readonly transactionId: string;
   readonly status: WagerTransactionStatus;
@@ -37,6 +42,6 @@ export interface ProcessWagerTransactionResult {
 
 export interface WagerTransactionProcessor {
   process(
-    command: NormalizedWagerTransactionCommand,
+    command: WagerTransactionProcessingCommand,
   ): Promise<ProcessWagerTransactionResult>;
 }

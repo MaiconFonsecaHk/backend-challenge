@@ -8,6 +8,7 @@ import type {
   ProcessWagerTransactionResult,
   WagerTransactionProcessor,
 } from '../../ports/wager-transaction-processor.js';
+import { WagerPayloadFingerprintService } from '../../services/wager-payload-fingerprint.js';
 import {
   Money,
   type MoneyProps,
@@ -37,13 +38,20 @@ const EXTERNAL_KINDS = new Set<WagerTransactionKind>([
 ]);
 
 export class ProcessWagerTransactionUseCase {
-  constructor(private readonly processor: WagerTransactionProcessor) {}
+  constructor(
+    private readonly processor: WagerTransactionProcessor,
+    private readonly payloadFingerprint: WagerPayloadFingerprintService,
+  ) {}
 
   async execute(
     command: ProcessWagerTransactionCommand,
   ): Promise<ProcessWagerTransactionResult> {
     const normalized = ProcessWagerTransactionUseCase.normalize(command);
-    const result = await this.processor.process(normalized);
+    const processingCommand = Object.freeze({
+      ...normalized,
+      payloadHash: this.payloadFingerprint.fingerprint(normalized),
+    });
+    const result = await this.processor.process(processingCommand);
 
     return Object.freeze({
       transactionId: result.transactionId,
