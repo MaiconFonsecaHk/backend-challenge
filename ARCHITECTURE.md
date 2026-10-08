@@ -33,14 +33,16 @@ Esses objetivos ainda não significam que os mecanismos concretos foram escolhid
 AppModule
 ├── ConfigModule
 ├── PersistenceModule
-│   └── MikroORM ── PostgreSQL
+│   └── MikroORM
+│       ├── registro explícito de modelos de persistência
+│       └── PostgreSQL
 └── HealthModule
     ├── GET /health/live
     ├── PostgreSQL health indicator ── MikroORM ── SELECT 1
     └── SQS health indicator ── AWS SDK v3 ── MiniStack/SQS
 ```
 
-Ainda não existem endpoints financeiros, entidades persistentes, consumidor SQS ou workers. O domínio puro da Fase 2 contém `Money`, `Wallet`, `WagerTransaction`, `WalletLedgerEntry`, os modelos de inbox/outbox e os eventos de integração; persistência e execução desses modelos serão adicionadas nas fases específicas do roadmap.
+Ainda não existem endpoints financeiros, tabelas de negócio, consumidor SQS ou workers. O domínio puro da Fase 2 contém `Money`, `Wallet`, `WagerTransaction`, `WalletLedgerEntry`, os modelos de inbox/outbox e os eventos de integração. A infraestrutura já descreve os cinco modelos persistentes correspondentes, mas migrations, constraints, repositórios e casos de uso continuam nas etapas específicas do roadmap.
 
 ## 4. Boundaries e dependências
 
@@ -183,14 +185,26 @@ O baseline atual não cria tabelas de domínio. Sua função é provar a cadeia 
 - **Evidência:** testes unitários cobrem replay e conflito de payload, terminalidade de inbox/outbox, timestamps defensivos, retry injetado, falha de agendamento sem mutação, serialização JSON profunda, rejeição de dados instáveis, envelopes versionados, todos os eventos obrigatórios e validação de suas entidades de origem.
 - **Limitação e gatilho de revisão:** limites de retry, backoff, leasing/locking, recuperação, ordem de publicação e comportamento com dois publishers só serão escolhidos após implementação e testes com PostgreSQL e SQS reais.
 
+### D-014 — Modelos do MikroORM separados do domínio e registrados explicitamente
+
+- **Status:** confirmada para o desenho e a descoberta dos metadados; DDL, constraints, índices e round-trip em PostgreSQL real continuam abertos.
+- **Requisito protegido:** o domínio deve permanecer independente do ORM, dinheiro não pode passar por `number` e runtime, CLI e migrations precisam descobrir o mesmo conjunto de modelos.
+- **Alternativas consideradas:** decorators do MikroORM nas entidades de domínio foram rejeitados por inverter a direção de dependência; `autoLoadEntities` isolado foi rejeitado porque só descobre entidades registradas em módulos Nest e não configura a CLI; mapear `Money` como objeto opaco foi rejeitado porque esconderia valor e moeda do schema; enums nativos do PostgreSQL não foram escolhidos porque aumentam o custo de evolução e reversão sem benefício demonstrado neste momento.
+- **Escolha:** cinco classes de persistência definidas com `defineEntity` vivem em `infrastructure`: wallet, wager transaction, ledger, inbox e outbox. Um registro único e explícito alimenta tanto o bootstrap do NestJS quanto a configuração da CLI. Relações financeiras usam foreign keys mapeadas para IDs escalares, evitando que referências do ORM atravessem a futura fronteira dos repositórios.
+- **Dinheiro e tempo:** valores monetários usam `numeric` com conversão do MikroORM para `string`, nunca `number`; moedas ocupam `char(3)` separado; timestamps usam `timestamptz`. Precisão máxima e autoridade de timestamps não foram inventadas. A escala fixa, moedas válidas e coerência entre colunas serão protegidas pelas constraints do próximo bloco.
+- **Estado recuperável:** a transação persiste o saldo original do resultado idempotente e o agendamento de referências pendentes; inbox usa identidade composta `(consumerName, messageId)`; outbox conserva o envelope em `jsonb`, tentativas e datas de agendamento/publicação.
+- **IDs:** chaves internas e `playerId` são armazenados como UUID, coerentes com os contratos do desafio; a decisão de onde e como gerar esses UUIDs continua aberta.
+- **Evidência:** testes inicializam a descoberta de metadados sem conexão de banco e verificam as cinco tabelas, tipos monetários em string, moedas, enums, relações, identidade da inbox e estado recuperável da outbox/transação. Type-check e build também validam o mesmo registro usado pela aplicação.
+- **Limitação e gatilho de revisão:** os metadados ainda não criam nem protegem tabelas por si só. A decisão só poderá ser promovida a garantia persistente depois de uma migration reversível e de testes contra PostgreSQL real, incluindo round-trip monetário e inspeção das constraints.
+
 ## 6. Decisões abertas
 
 Nenhuma alternativa desta tabela está escolhida antecipadamente.
 
 | Decisão | Requisito protegido | Alternativas que precisam ser avaliadas | Evidência necessária para fechar |
 | --- | --- | --- | --- |
-| Mapeamento persistente de `Money` | precisão decimal e moeda consistente no PostgreSQL | colunas separadas para valor/moeda e formas de conversão do MikroORM | teste de round-trip contra banco real sem perda de escala ou precisão |
-| Estratégia de IDs | unicidade e ordenação quando necessária | UUID gerado na aplicação, UUID no banco ou outra estratégia justificada | testes de geração, persistência e concorrência |
+| Validação persistente de `Money` | precisão decimal e moeda consistente no PostgreSQL | o desenho `numeric` como string + `char(3)` precisa ser confrontado com DDL, constraints e reidratação reais | teste de round-trip contra banco real sem perda de escala ou precisão |
+| Geração de IDs | unicidade e ordenação quando necessária | UUID gerado na aplicação, UUID gerado no banco ou outra estratégia justificada | testes de geração, persistência e concorrência |
 | Autoridade dos timestamps | resultados testáveis e timestamps consistentes | instante fornecido pelo `Clock`, timestamp do PostgreSQL ou combinação documentada | testes determinísticos, persistência e comportamento entre instâncias |
 | Limite transacional | atomicidade de wallet, ledger, transação, inbox e outbox | desenho do caso de uso e escopo do `EntityManager.transactional()` | testes de rollback e falha antes/depois do commit |
 | Concorrência por wallet | impedir saldo negativo e lost update sem lock global | lock pessimista, lock otimista com retry, update condicionado ou combinação | duas apostas concorrentes, hot wallet, wallets distintas e três instâncias |
@@ -240,11 +254,12 @@ bun run migration:up
 bun run migration:down
 ```
 
-O ciclo de migration deve ser comprovado em banco descartável antes de alterações reais de schema. Testes de integração e concorrência serão adicionados nas fases correspondentes; os testes atuais comprovam o runner do Bun, a normalização básica da configuração e o comportamento puro das entidades, mensagens e eventos da Fase 2.
+O ciclo de migration deve ser comprovado em banco descartável antes de alterações reais de schema. Testes de integração e concorrência serão adicionados nas fases correspondentes; os testes atuais comprovam o runner do Bun, a normalização básica da configuração, o comportamento puro da Fase 2 e a descoberta dos cinco modelos persistentes com seus tipos e relações.
 
 ## 10. Limitações atuais
 
-- os modelos puros da Fase 2 ainda não possuem casos de uso nem persistência;
+- os modelos puros da Fase 2 ainda não possuem casos de uso, mappers nem repositórios;
+- os modelos do MikroORM existem, mas ainda não há migration que materialize as tabelas de negócio;
 - não existem tabelas de negócio ou constraints financeiras;
 - não existem endpoints de wallet, wagering ou ledger;
 - não existem consumer, inbox, outbox ou publisher;
