@@ -190,15 +190,15 @@ O baseline permanece neutro e prova a cadeia inicial. A migration seguinte cont�
 
 ### D-014 — Modelos do MikroORM separados do domínio e registrados explicitamente
 
-- **Status:** confirmada para desenho, descoberta, DDL, constraints e índices de consulta; o round-trip automatizado em PostgreSQL real continua aberto.
+- **Status:** confirmada para desenho, descoberta, DDL, constraints, índices de consulta e round-trip automatizado em PostgreSQL real.
 - **Requisito protegido:** o domínio deve permanecer independente do ORM, dinheiro não pode passar por `number` e runtime, CLI e migrations precisam descobrir o mesmo conjunto de modelos.
 - **Alternativas consideradas:** decorators do MikroORM nas entidades de domínio foram rejeitados por inverter a direção de dependência; `autoLoadEntities` isolado foi rejeitado porque só descobre entidades registradas em módulos Nest e não configura a CLI; mapear `Money` como objeto opaco foi rejeitado porque esconderia valor e moeda do schema; enums nativos do PostgreSQL não foram escolhidos porque aumentam o custo de evolução e reversão sem benefício demonstrado neste momento.
 - **Escolha:** cinco classes de persistência definidas com `defineEntity` vivem em `infrastructure`: wallet, wager transaction, ledger, inbox e outbox. Um registro único e explícito alimenta tanto o bootstrap do NestJS quanto a configuração da CLI. Relações financeiras usam foreign keys mapeadas para IDs escalares, evitando que referências do ORM atravessem a futura fronteira dos repositórios.
 - **Dinheiro e tempo:** valores monetários usam `numeric` com conversão do MikroORM para `string`, nunca `number`; moedas ocupam `char(3)` separado; timestamps usam `timestamptz`. Precisão máxima e autoridade de timestamps não foram inventadas. Constraints agora rejeitam frações além de duas casas sem arredondamento silencioso, códigos de moeda inválidos, valores e saldos incompatíveis.
 - **Estado recuperável:** a transação persiste o saldo original do resultado idempotente e o agendamento de referências pendentes; inbox usa identidade composta `(consumerName, messageId)`; outbox conserva o envelope em `jsonb`, tentativas e datas de agendamento/publicação.
 - **IDs:** chaves internas e `playerId` são armazenados como UUID, coerentes com os contratos do desafio; a decisão de onde e como gerar esses UUIDs continua aberta.
-- **Evidência:** testes inicializam a descoberta de metadados sem conexão de banco e verificam as cinco tabelas, tipos monetários em string, moedas, enums, relações, identidade da inbox e estado recuperável da outbox/transação. Type-check e build também validam o mesmo registro usado pela aplicação.
-- **Limitação e gatilho de revisão:** migrations e provas diretas contra PostgreSQL confirmam o DDL e as rejeições, mas o round-trip monetário por repositório e a suíte automatizada de integração do schema pertencem aos próximos blocos.
+- **Evidência:** testes inicializam a descoberta de metadados sem conexão e verificam as cinco tabelas, tipos monetários em string, moedas, enums, relações, identidade da inbox e estado recuperável da outbox/transação. A suíte de integração persiste e reidrata os cinco modelos por seus repositórios em PostgreSQL real, incluindo `9007199254740993.12 BRL`, sem conversão para `number` nem perda de precisão. Type-check e build validam o mesmo registro usado pela aplicação.
+- **Limitação e gatilho de revisão:** a representação `numeric` sem precisão máxima preserva os valores exigidos sem arredondamento silencioso, mas limites operacionais de tamanho de payload e valor ainda poderão ser definidos por contrato quando houver evidência de negócio.
 
 ### D-015 — Invariantes persistentes usam constraints antes de triggers
 
@@ -209,8 +209,8 @@ O baseline permanece neutro e prova a cadeia inicial. A migration seguinte cont�
 - **Escolha para regras relacionais:** foreign keys preservam wallet, transação, ledger e referência resolvida. Triggers são restritos a regras que dependem da operação ou de outra linha: identidade e versão da wallet, terminalidade e contexto da transação, validade da referência, contexto do ledger e rejeição de `UPDATE`/`DELETE` no ledger.
 - **Inbox e outbox:** inbox é identificada por `(consumerName, messageId)`. Outbox usa `aggregateId` polimórfico para eventos de wallet ou transação; uma foreign key única não representaria ambos os alvos com integridade real. A ligação será garantida pela mesma transação SQL e testada no Unit of Work, sem inventar uma referência falsa.
 - **Trade-off:** triggers oferecem defesa final para invariantes relacionais, mas aumentam a complexidade do schema e exigem que a aplicação traduza SQLSTATEs estáveis. Operações administrativas capazes de desabilitar triggers permanecem fora do papel da aplicação e deverão ser restringidas operacionalmente.
-- **Evidência:** PostgreSQL real aceitou um conjunto coerente de wallet, aposta processada, ledger, inbox e outbox; 22 tentativas inválidas foram rejeitadas pela constraint ou trigger nominal esperada. O catálogo confirmou 39 checks/unicidades nomeados e quatro triggers. O rollback removeu os objetos gerenciados, a reaplicação os restaurou e a comparação final não encontrou drift.
-- **Limitação e gatilho de revisão:** a igualdade agregada entre saldo materializado e soma do ledger não é uma constraint de uma única linha. Ela será garantida pelo limite transacional do caso de uso e comprovada por testes de rollback, concorrência e reconciliação. A automação desses testes contra PostgreSQL continua no item de integração do schema.
+- **Evidência:** PostgreSQL real aceitou um conjunto coerente de wallet, aposta processada, ledger, inbox e outbox; 22 tentativas inválidas da inspeção inicial e uma suíte automatizada representativa confirmaram rejeições pelas constraints ou triggers esperadas. O teste automatizado cobre unicidade de wallet, idempotency key e inbox, saldo não negativo, tentativas de outbox não negativas e bloqueio de `UPDATE`/`DELETE` no ledger. O catálogo confirmou 39 checks/unicidades nomeados e quatro triggers. O rollback removeu os objetos gerenciados, a reaplicação os restaurou e a comparação final não encontrou drift.
+- **Limitação e gatilho de revisão:** a igualdade agregada entre saldo materializado e soma do ledger não é uma constraint de uma única linha. Ela será garantida pelo limite transacional dos casos de uso e comprovada novamente por testes de concorrência e reconciliação.
 
 ### D-016 — Índices seguem acessos demonstrados e evitam duplicar unicidades
 
@@ -226,7 +226,7 @@ O baseline permanece neutro e prova a cadeia inicial. A migration seguinte cont�
 
 ### D-017 — Repositórios são portas puras e o Unit of Work controla a transação
 
-- **Status:** confirmada para os contratos, mappers e adapters MikroORM; a prova de commit e rollback contra PostgreSQL real pertence ao próximo bloco de integração.
+- **Status:** confirmada para contratos, mappers, adapters MikroORM e semântica real de commit e rollback no PostgreSQL.
 - **Requisito protegido:** wallet, transação de aposta, ledger, inbox e outbox precisam compartilhar uma única transação SQL sem expor MikroORM ao domínio ou permitir que cada repositório confirme seus efeitos isoladamente.
 - **Alternativas consideradas:** injetar repositórios do MikroORM diretamente nos casos de uso foi rejeitado porque vazaria tipos e ciclo de vida do ORM para a aplicação; permitir `flush` ou `transactional()` em cada repositório foi rejeitado porque poderia confirmar efeitos parciais; um repositório genérico foi rejeitado porque esconderia identidades, consultas e regras diferentes, especialmente a natureza append-only do ledger; decorators nas entidades de domínio continuam rejeitados pela direção de dependência.
 - **Escolha para as portas:** a aplicação define contratos específicos para wallet, wager transaction, ledger, inbox e outbox. O ledger expõe somente leitura por identidade financeira e inclusão, sem `save` ou `delete`. O repositório de transações devolve um `WagerTransactionRecord` que conserva a entidade de domínio, o saldo original do resultado, tentativas de referência e próximo agendamento, evitando perder dados necessários para replay e recuperação.
@@ -234,8 +234,17 @@ O baseline permanece neutro e prova a cadeia inicial. A migration seguinte cont�
 - **Escolha para o Unit of Work:** `MikroOrmUnitOfWork.execute()` abre `EntityManager.transactional()` e cria todos os repositórios com o mesmo `EntityManager` transacional. Os adapters apenas registram inclusões ou atribuem estado mutável; nenhum chama `flush`, inicia transação própria ou publica evento. O provider é exportado por token de aplicação, não pela classe concreta do ORM.
 - **Atualizações:** `add` é explícito e `save` exige que o registro já exista, falhando em vez de transformar silenciosamente uma atualização em inserção. Wallet, wager transaction, inbox e outbox atualizam somente seus campos mutáveis; identidade e payload imutáveis não são reassinados. Ledger permanece sem caminho de atualização ou exclusão.
 - **Trade-off:** todo caso de uso persistente precisa entrar pelo callback do Unit of Work e construir o registro operacional completo da transação de aposta. Essa disciplina acrescenta tipos e mappers, mas deixa o limite transacional visível e testável. Consultas de worker, locking, paginação do ledger e tradução de erros SQL continuam fora desses contratos até suas decisões próprias.
-- **Evidência:** testes unitários exercitam round-trip exato dos cinco modelos, inclusive decimal acima do limite seguro, saldo original e estado de referência; verificam as identidades de consulta, inclusão sem flush, atualização restrita a estado mutável, ausência de update no ledger, falha explícita de `save` inexistente, compartilhamento do mesmo `EntityManager` e propagação de erro pelo limite transacional. Type-check e build validam a composição do provider no NestJS.
-- **Limitação e gatilho de revisão:** doubles comprovam a direção das chamadas, mas não provam semântica real de commit, rollback, identity map, constraints ou round-trip do driver PostgreSQL. Essas garantias só serão fechadas pelos testes de integração do schema em banco real, item imediatamente seguinte do roadmap.
+- **Evidência:** testes unitários exercitam round-trip exato dos cinco modelos, saldo original e estado de referência; verificam identidades de consulta, inclusão sem flush, atualização restrita, ausência de update no ledger, falha explícita de `save` inexistente, compartilhamento do mesmo `EntityManager` e propagação de erro. No PostgreSQL real, a Unit of Work confirmou atomicamente wallet, `OPENING`, ledger, inbox e outbox; outra execução enviou primeiro o `INSERT` da wallet, falhou depois na constraint da transação dependente e o `ROLLBACK` removeu ambos os efeitos. Type-check e build validam a composição do provider no NestJS.
+- **Limitação e gatilho de revisão:** o limite técnico está comprovado, mas cada caso de uso financeiro ainda precisa demonstrar que inclui todos os efeitos exigidos e que sua estratégia de concorrência preserva o mesmo limite sob disputa real.
+
+### D-018 — Integração PostgreSQL usa um banco temporário isolado por execução
+
+- **Status:** confirmada para os testes de schema e persistência.
+- **Requisito protegido:** migrations, constraints, repositórios e rollback precisam ser comprovados em PostgreSQL real sem depender do estado do banco de desenvolvimento nem destruir dados preexistentes.
+- **Alternativas consideradas:** mocks ou banco em memória foram rejeitados porque não reproduzem `numeric`, SQLSTATE, constraints, triggers e transações do PostgreSQL; limpar o banco padrão foi rejeitado por risco de perda de dados e interferência entre execuções; schema temporário foi considerado, mas um banco dedicado representa melhor o ciclo de instalação desde zero e evita vazamento de `search_path`; Testcontainers foi adiado porque o Docker Compose obrigatório já fornece a infraestrutura e outra dependência não acrescentaria uma garantia nova nesta fase.
+- **Escolha:** `test:integration:postgres` conecta ao PostgreSQL do Compose, cria um banco com prefixo validado `backend_challenge_it_`, aplica a lista explícita de migrations e remove exclusivamente esse banco no `afterAll`, inclusive após falha. O nome aleatório permite execuções independentes e o descarte encerra conexões remanescentes antes do `DROP DATABASE`.
+- **Trade-off:** o teste exige PostgreSQL acessível e permissão `CREATEDB`, por isso permanece em script dedicado e é ignorado pela suíte unitária quando a flag explícita não está presente. Em troca, a prova é fiel ao driver e mantém `bun run test` rápido e utilizável sem infraestrutura.
+- **Evidência:** cinco testes reais aplicam quatro migrations em banco limpo, persistem e reidratam os cinco modelos, verificam constraints e imutabilidade, observam `BEGIN`, inserts, `ROLLBACK`, ausência dos efeitos revertidos, executam todos os `down`, confirmam zero tabelas da aplicação e reaplicam o schema completo. A consulta administrativa após a suíte confirmou que nenhum banco temporário permaneceu.
 
 ## 6. Decisões abertas
 
@@ -243,10 +252,9 @@ Nenhuma alternativa desta tabela está escolhida antecipadamente.
 
 | Decisão | Requisito protegido | Alternativas que precisam ser avaliadas | Evidência necessária para fechar |
 | --- | --- | --- | --- |
-| Validação persistente de `Money` | precisão decimal e moeda consistente no PostgreSQL | o desenho `numeric` como string + `char(3)` precisa ser confrontado com DDL, constraints e reidratação reais | teste de round-trip contra banco real sem perda de escala ou precisão |
 | Geração de IDs | unicidade e ordenação quando necessária | UUID gerado na aplicação, UUID gerado no banco ou outra estratégia justificada | testes de geração, persistência e concorrência |
 | Autoridade dos timestamps | resultados testáveis e timestamps consistentes | instante fornecido pelo `Clock`, timestamp do PostgreSQL ou combinação documentada | testes determinísticos, persistência e comportamento entre instâncias |
-| Limite transacional | atomicidade de wallet, ledger, transação, inbox e outbox | desenho do caso de uso e escopo do `EntityManager.transactional()` | testes de rollback e falha antes/depois do commit |
+| Limite transacional dos casos de uso | atomicidade de wallet, ledger, transação, inbox e outbox | composição de cada operação financeira dentro do Unit of Work já comprovado | testes de falha antes/depois do commit e concorrência para cada caso de uso |
 | Concorrência por wallet | impedir saldo negativo e lost update sem lock global | lock pessimista, lock otimista com retry, update condicionado ou combinação | duas apostas concorrentes, hot wallet, wallets distintas e três instâncias |
 | Idempotência HTTP | replay idêntico sem duplicar efeitos | chave persistente, estado armazenado, canonicalização e algoritmo de hash | mesma requisição 50 vezes, payload divergente e falha concorrente |
 | Inbox SQS | deduplicação persistente e ack após commit | modelo de inbox e fronteira transacional do consumer | redelivery, crash após commit e antes do ack, múltiplos consumers |
@@ -262,7 +270,7 @@ Nenhuma alternativa desta tabela está escolhida antecipadamente.
 
 ## 7. Modelo transacional — estado atual
 
-O Unit of Work e os repositórios já estabelecem o limite técnico de uma transação SQL compartilhada. Os casos de uso financeiros e as provas reais de commit, rollback e concorrência ainda não foram implementados. A restrição estabelecida é:
+O Unit of Work e os repositórios estabelecem o limite técnico de uma transação SQL compartilhada. Commit e rollback desse limite foram comprovados no PostgreSQL real; os casos de uso financeiros e as provas de concorrência ainda não foram implementados. A restrição estabelecida é:
 
 ```text
 wallet + ledger + wager transaction + inbox + outbox
@@ -289,21 +297,21 @@ docker compose up -d --wait
 bun run typecheck
 bun run build
 bun run test
+bun run test:integration:postgres
 bun run migration:pending
 bun run migration:up
 bun run migration:down
 ```
 
-O ciclo `up → inspeção → down → inspeção → up` foi comprovado em banco PostgreSQL temporário, seguido por uma comparação sem drift entre banco, snapshot e metadados. As constraints também foram exercitadas diretamente com um fixture válido e 22 violações intencionais. Os três índices orientados a acesso foram validados com dados representativos e `EXPLAIN (ANALYZE, BUFFERS)`, que selecionou naturalmente cada índice pretendido. A automação de integração e os testes de concorrência serão adicionados nas fases correspondentes; os testes atuais também comprovam o runner do Bun, a normalização básica da configuração, o comportamento puro da Fase 2 e a descoberta dos modelos persistentes.
+O ciclo `up → inspeção → down → inspeção → up` agora é automatizado em um banco temporário criado por execução. A suíte PostgreSQL também comprova round-trip exato dos cinco modelos, commit, rollback após SQL efetivamente executado, constraints representativas e imutabilidade do ledger. A inspeção inicial permanece como evidência ampliada de 22 violações e dos planos dos três índices com dados representativos. Os testes de concorrência e de SQS serão adicionados nas fases correspondentes; a suíte atual também comprova o runner do Bun, a configuração, o comportamento puro do domínio e os contratos de persistência.
 
 ## 10. Limitações atuais
 
 - os modelos puros da Fase 2 ainda não possuem casos de uso;
-- tabelas, constraints, índices, mappers, repositórios e Unit of Work existem, mas ainda faltam testes automatizados de integração contra o schema real;
 - não existem endpoints de wallet, wagering ou ledger;
 - não existem consumer, inbox, outbox ou publisher;
 - não existem garantias implementadas de concorrência ou idempotência;
-- não existem testes automatizados de integração, concorrência ou crash recovery;
+- não existem testes automatizados de integração com SQS, concorrência ou crash recovery;
 - não existem autenticação, logs estruturados ou métricas de negócio;
 - o comportamento do emulador local não substitui validação operacional em AWS real.
 

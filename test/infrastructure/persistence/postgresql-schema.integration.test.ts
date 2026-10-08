@@ -1,0 +1,538 @@
+import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { Migrator } from '@mikro-orm/migrations';
+import { MikroORM } from '@mikro-orm/postgresql';
+
+import { databaseEnvironmentSchema } from '../../../src/config/environment.schema.js';
+import { LedgerDirection } from '../../../src/domain/ledger/ledger-direction.js';
+import { WalletLedgerEntry } from '../../../src/domain/ledger/wallet-ledger-entry.js';
+import { InboxMessage } from '../../../src/domain/messaging/inbox-message.js';
+import { OutboxMessage } from '../../../src/domain/messaging/outbox-message.js';
+import { Money } from '../../../src/domain/shared/value-objects/money.js';
+import {
+  WagerTransaction,
+  WagerTransactionKind,
+} from '../../../src/domain/wagering/wager-transaction.js';
+import { Wallet } from '../../../src/domain/wallet/wallet.js';
+import { PERSISTENCE_ENTITIES } from '../../../src/infrastructure/persistence/entities/persistence-entities.js';
+import { Migration20261007155000Baseline } from '../../../src/infrastructure/persistence/migrations/Migration20261007155000Baseline.js';
+import { Migration20261008015154_create_persistence_tables } from '../../../src/infrastructure/persistence/migrations/Migration20261008015154_create_persistence_tables.js';
+import { Migration20261008021520_enforce_persistence_constraints } from '../../../src/infrastructure/persistence/migrations/Migration20261008021520_enforce_persistence_constraints.js';
+import { Migration20261008023045_add_access_pattern_indexes } from '../../../src/infrastructure/persistence/migrations/Migration20261008023045_add_access_pattern_indexes.js';
+import { MikroOrmUnitOfWork } from '../../../src/infrastructure/persistence/mikro-orm.unit-of-work.js';
+
+const APPLICATION_TABLES = [
+  'inbox_messages',
+  'outbox_messages',
+  'wager_transactions',
+  'wallet_ledger_entries',
+  'wallets',
+] as const;
+const CREATED_AT = new Date('2026-10-08T12:00:00.000Z');
+const PROCESSED_AT = new Date('2026-10-08T12:01:00.000Z');
+const EXACT_BALANCE = '9007199254740993.12';
+const OPENING_ID = '30000000-0000-4000-8000-000000000101';
+const OPENING_LEDGER_ID = '40000000-0000-4000-8000-000000000101';
+const OUTBOX_ID = '50000000-0000-4000-8000-000000000101';
+const PLAYER_ID = '20000000-0000-4000-8000-000000000101';
+const WALLET_ID = '10000000-0000-4000-8000-000000000101';
+const TEST_DATABASE_PREFIX = 'backend_challenge_it_';
+const integrationEnabled =
+  process.env.RUN_POSTGRES_INTEGRATION_TESTS === 'true';
+const describePostgreSql = integrationEnabled ? describe : describe.skip;
+
+interface PostgreSqlErrorDetails {
+  readonly code?: string;
+  readonly constraint?: string;
+}
+
+interface TableNameRow {
+  readonly table_name: string;
+}
+
+let administrationOrm: MikroORM | undefined;
+let applicationOrm: MikroORM | undefined;
+let databaseName = '';
+const queryLog: string[] = [];
+
+function testEnvironment() {
+  return databaseEnvironmentSchema.parse({
+    POSTGRES_DB: process.env.POSTGRES_DB ?? 'backend_challenge',
+    POSTGRES_HOST: process.env.POSTGRES_HOST ?? '127.0.0.1',
+    POSTGRES_PASSWORD:
+      process.env.POSTGRES_PASSWORD ?? 'backend_challenge_local',
+    POSTGRES_PORT: process.env.POSTGRES_PORT ?? '5432',
+    POSTGRES_USER: process.env.POSTGRES_USER ?? 'backend_challenge',
+  });
+}
+
+function createDatabaseName(): string {
+  const randomSuffix = crypto.randomUUID().replaceAll('-', '').slice(0, 12);
+  return `${TEST_DATABASE_PREFIX}${process.pid}_${randomSuffix}`.toLowerCase();
+}
+
+function quoteTestDatabaseIdentifier(value: string): string {
+  if (!/^backend_challenge_it_[a-z0-9_]+$/u.test(value)) {
+    throw new Error(`Refusing to use unsafe integration database name: ${value}`);
+  }
+
+  return `"${value}"`;
+}
+
+function requiredApplicationOrm(): MikroORM {
+  if (applicationOrm === undefined) {
+    throw new Error('PostgreSQL integration ORM is not initialized');
+  }
+
+  return applicationOrm;
+}
+
+function requiredAdministrationOrm(): MikroORM {
+  if (administrationOrm === undefined) {
+    throw new Error('PostgreSQL administration ORM is not initialized');
+  }
+
+  return administrationOrm;
+}
+
+function money(amount: string): Money {
+  return Money.from({ amount, currency: 'BRL' });
+}
+
+function postgresErrorDetails(error: unknown): PostgreSqlErrorDetails {
+  let current: unknown = error;
+
+  for (let depth = 0; depth < 5 && current !== undefined; depth += 1) {
+    if (typeof current !== 'object' || current === null) {
+      break;
+    }
+
+    const candidate = current as PostgreSqlErrorDetails & { cause?: unknown };
+    if (candidate.code !== undefined) {
+      return candidate;
+    }
+
+    current = candidate.cause;
+  }
+
+  return {};
+}
+
+async function expectPostgreSqlError(
+  operation: () => Promise<unknown>,
+  code: string,
+  constraint?: string,
+): Promise<void> {
+  let caught: unknown;
+
+  try {
+    await operation();
+  } catch (error) {
+    caught = error;
+  }
+
+  expect(caught).toBeDefined();
+  const details = postgresErrorDetails(caught);
+  expect(details.code).toBe(code);
+  if (constraint !== undefined) {
+    expect(details.constraint).toBe(constraint);
+  }
+}
+
+async function applicationTableNames(): Promise<string[]> {
+  const rows = await requiredApplicationOrm().em.getConnection().execute<
+    TableNameRow[]
+  >(
+    `select table_name
+       from information_schema.tables
+      where table_schema = 'public'
+        and table_name in (
+          'inbox_messages',
+          'outbox_messages',
+          'wager_transactions',
+          'wallet_ledger_entries',
+          'wallets'
+        )
+      order by table_name`,
+  );
+
+  return rows.map((row) => row.table_name);
+}
+
+async function migrateDownCompletely(): Promise<void> {
+  const migrator = requiredApplicationOrm().migrator;
+
+  for (let remaining = 10; remaining > 0; remaining -= 1) {
+    const executed = await migrator.getExecuted();
+    if (executed.length === 0) {
+      return;
+    }
+
+    await migrator.down();
+  }
+
+  throw new Error('Migration rollback exceeded the expected safety limit');
+}
+
+async function persistCompleteOpening(): Promise<void> {
+  const wallet = Wallet.open({
+    id: WALLET_ID,
+    playerId: PLAYER_ID,
+    initialBalance: money(EXACT_BALANCE),
+    openedAt: CREATED_AT,
+  });
+  const opening = WagerTransaction.create({
+    id: OPENING_ID,
+    providerId: 'internal',
+    externalTransactionId: `opening:${WALLET_ID}`,
+    idempotencyKey: `opening:${WALLET_ID}`,
+    payloadHash: 'opening-payload-hash',
+    walletId: WALLET_ID,
+    playerId: PLAYER_ID,
+    roundId: `opening:${WALLET_ID}`,
+    gameId: 'internal-wallet-opening',
+    kind: WagerTransactionKind.Opening,
+    money: money(EXACT_BALANCE),
+    createdAt: CREATED_AT,
+  });
+  opening.markProcessed(undefined, PROCESSED_AT);
+
+  const ledgerEntry = WalletLedgerEntry.create({
+    id: OPENING_LEDGER_ID,
+    walletId: WALLET_ID,
+    transactionId: OPENING_ID,
+    direction: LedgerDirection.Credit,
+    money: money(EXACT_BALANCE),
+    balanceBefore: money('0.00'),
+    balanceAfter: money(EXACT_BALANCE),
+    createdAt: PROCESSED_AT,
+  });
+  const inboxMessage = InboxMessage.receive({
+    consumerName: 'postgres-integration-test',
+    messageId: 'opening-message',
+    payloadHash: 'opening-payload-hash',
+    receivedAt: CREATED_AT,
+  });
+  inboxMessage.markProcessed(PROCESSED_AT);
+  const outboxMessage = OutboxMessage.rehydrate({
+    id: OUTBOX_ID,
+    aggregateId: WALLET_ID,
+    eventType: 'wallet.opened.v1',
+    payload: {
+      aggregateId: WALLET_ID,
+      balance: { amount: EXACT_BALANCE, currency: 'BRL' },
+      eventId: OUTBOX_ID,
+    },
+    occurredAt: PROCESSED_AT,
+    attempts: 0,
+  });
+
+  await new MikroOrmUnitOfWork(requiredApplicationOrm()).execute(
+    async (repositories) => {
+      await repositories.wallets.add(wallet);
+      await repositories.wagerTransactions.add({
+        transaction: opening,
+        resultBalance: wallet.balance,
+        referenceAttempts: 0,
+      });
+      await repositories.walletLedgerEntries.add(ledgerEntry);
+      await repositories.inboxMessages.add(inboxMessage);
+      await repositories.outboxMessages.add(outboxMessage);
+    },
+  );
+}
+
+describePostgreSql('PostgreSQL schema integration', () => {
+  beforeAll(async () => {
+    const environment = testEnvironment();
+    databaseName = createDatabaseName();
+    const quotedDatabaseName = quoteTestDatabaseIdentifier(databaseName);
+
+    administrationOrm = await MikroORM.init({
+      dbName: 'postgres',
+      entities: [...PERSISTENCE_ENTITIES],
+      host: environment.POSTGRES_HOST,
+      password: environment.POSTGRES_PASSWORD,
+      pool: { max: 1, min: 0 },
+      port: environment.POSTGRES_PORT,
+      user: environment.POSTGRES_USER,
+    });
+
+    await administrationOrm.em
+      .getConnection()
+      .execute(`create database ${quotedDatabaseName}`);
+
+    applicationOrm = await MikroORM.init({
+      dbName: databaseName,
+      debug: ['query'],
+      entities: [...PERSISTENCE_ENTITIES],
+      extensions: [Migrator],
+      host: environment.POSTGRES_HOST,
+      logger: (message) => queryLog.push(message),
+      migrations: {
+        allOrNothing: true,
+        migrationsList: [
+          Migration20261007155000Baseline,
+          Migration20261008015154_create_persistence_tables,
+          Migration20261008021520_enforce_persistence_constraints,
+          Migration20261008023045_add_access_pattern_indexes,
+        ],
+        snapshot: false,
+        transactional: true,
+      },
+      password: environment.POSTGRES_PASSWORD,
+      pool: { max: 5, min: 0 },
+      port: environment.POSTGRES_PORT,
+      user: environment.POSTGRES_USER,
+    });
+  });
+
+  afterAll(async () => {
+    if (applicationOrm !== undefined) {
+      await applicationOrm.close(true);
+      applicationOrm = undefined;
+    }
+
+    if (administrationOrm !== undefined && databaseName.length > 0) {
+      const administrationConnection = administrationOrm.em.getConnection();
+      await administrationConnection.execute(
+        'select pg_terminate_backend(pid) from pg_stat_activity where datname = ? and pid <> pg_backend_pid()',
+        [databaseName],
+      );
+      await administrationConnection.execute(
+        `drop database if exists ${quoteTestDatabaseIdentifier(databaseName)}`,
+      );
+      await administrationOrm.close(true);
+      administrationOrm = undefined;
+    }
+  });
+
+  test('applies every migration to a clean database', async () => {
+    const migrator = requiredApplicationOrm().migrator;
+    expect(await migrator.getExecuted()).toHaveLength(0);
+
+    await migrator.up();
+
+    expect(
+      (await migrator.getExecuted()).map((migration) => migration.name),
+    ).toEqual([
+      'Migration20261007155000Baseline',
+      'Migration20261008015154_create_persistence_tables',
+      'Migration20261008021520_enforce_persistence_constraints',
+      'Migration20261008023045_add_access_pattern_indexes',
+    ]);
+    expect(await applicationTableNames()).toEqual([...APPLICATION_TABLES]);
+  });
+
+  test('commits and rehydrates a complete opening without monetary precision loss', async () => {
+    await persistCompleteOpening();
+
+    await new MikroOrmUnitOfWork(requiredApplicationOrm()).execute(
+      async (repositories) => {
+        const wallet = await repositories.wallets.findById(WALLET_ID);
+        const opening = await repositories.wagerTransactions.findById(OPENING_ID);
+        const ledgerEntry =
+          await repositories.walletLedgerEntries.findByWalletAndTransaction(
+            WALLET_ID,
+            OPENING_ID,
+          );
+        const inboxMessage = await repositories.inboxMessages.findByIdentity(
+          'postgres-integration-test',
+          'opening-message',
+        );
+        const outboxMessage = await repositories.outboxMessages.findById(OUTBOX_ID);
+
+        expect(wallet?.balance.toJSON()).toEqual({
+          amount: EXACT_BALANCE,
+          currency: 'BRL',
+        });
+        expect(opening?.resultBalance?.toJSON()).toEqual({
+          amount: EXACT_BALANCE,
+          currency: 'BRL',
+        });
+        expect(ledgerEntry?.balanceAfter.toJSON()).toEqual({
+          amount: EXACT_BALANCE,
+          currency: 'BRL',
+        });
+        expect(inboxMessage?.isProcessed()).toBe(true);
+        expect(outboxMessage?.payload).toEqual({
+          aggregateId: WALLET_ID,
+          balance: { amount: EXACT_BALANCE, currency: 'BRL' },
+          eventId: OUTBOX_ID,
+        });
+      },
+    );
+  });
+
+  test('rejects critical uniqueness, nonnegative and immutability violations', async () => {
+    const connection = requiredApplicationOrm().em.getConnection();
+
+    await expectPostgreSqlError(
+      () =>
+        connection.execute(
+          `insert into wallets (id, player_id, currency, balance, version, created_at, updated_at)
+           values (?, ?, 'BRL', '10.00', 1, ?, ?)`,
+          [
+            '10000000-0000-4000-8000-000000000102',
+            PLAYER_ID,
+            CREATED_AT,
+            CREATED_AT,
+          ],
+        ),
+      '23505',
+      'wallets_player_id_currency_unique',
+    );
+    await expectPostgreSqlError(
+      () =>
+        connection.execute(
+          `insert into wallets (id, player_id, currency, balance, version, created_at, updated_at)
+           values (?, ?, 'BRL', '-0.01', 1, ?, ?)`,
+          [
+            '10000000-0000-4000-8000-000000000103',
+            '20000000-0000-4000-8000-000000000103',
+            CREATED_AT,
+            CREATED_AT,
+          ],
+        ),
+      '23514',
+      'wallets_balance_nonnegative_check',
+    );
+    await expectPostgreSqlError(
+      () =>
+        connection.execute(
+          `insert into wager_transactions (
+             id, provider_id, external_transaction_id, idempotency_key, payload_hash,
+             wallet_id, player_id, round_id, game_id, kind, status, amount, currency,
+             reference_attempts, created_at
+           ) values (?, 'provider-a', 'external-duplicate-key', ?, 'payload-hash', ?, ?,
+                     'round-1', 'game-1', 'BET', 'PENDING', '1.00', 'BRL', 0, ?)`,
+          [
+            '30000000-0000-4000-8000-000000000102',
+            `opening:${WALLET_ID}`,
+            WALLET_ID,
+            PLAYER_ID,
+            CREATED_AT,
+          ],
+        ),
+      '23505',
+      'wager_transactions_idempotency_key_unique',
+    );
+    await expectPostgreSqlError(
+      () =>
+        connection.execute(
+          `insert into inbox_messages (consumer_name, message_id, payload_hash, received_at)
+           values ('postgres-integration-test', 'opening-message', 'other-hash', ?)`,
+          [CREATED_AT],
+        ),
+      '23505',
+      'inbox_messages_pkey',
+    );
+    await expectPostgreSqlError(
+      () =>
+        connection.execute(
+          `insert into outbox_messages (
+             id, aggregate_id, event_type, payload, occurred_at, attempts
+           ) values (?, ?, 'invalid.retry.v1', '{}'::jsonb, ?, -1)`,
+          [
+            '50000000-0000-4000-8000-000000000102',
+            WALLET_ID,
+            CREATED_AT,
+          ],
+        ),
+      '23514',
+      'outbox_messages_attempts_nonnegative_check',
+    );
+    await expectPostgreSqlError(
+      () =>
+        connection.execute(
+          'update wallet_ledger_entries set balance_after = balance_after + 1 where id = ?',
+          [OPENING_LEDGER_ID],
+        ),
+      '55000',
+    );
+    await expectPostgreSqlError(
+      () =>
+        connection.execute('delete from wallet_ledger_entries where id = ?', [
+          OPENING_LEDGER_ID,
+        ]),
+      '55000',
+    );
+  });
+
+  test('rolls back executed writes when the Unit of Work flush fails', async () => {
+    const unitOfWork = new MikroOrmUnitOfWork(requiredApplicationOrm());
+    const rollbackWalletId = '10000000-0000-4000-8000-000000000104';
+    const rollbackPlayerId = '20000000-0000-4000-8000-000000000104';
+    const wallet = Wallet.open({
+      id: rollbackWalletId,
+      playerId: rollbackPlayerId,
+      initialBalance: money('0.00'),
+      openedAt: CREATED_AT,
+    });
+    const rollbackTransactionId = '30000000-0000-4000-8000-000000000104';
+    const rollbackTransaction = WagerTransaction.create({
+      id: rollbackTransactionId,
+      providerId: 'rollback-probe',
+      externalTransactionId: 'rollback-probe-transaction',
+      idempotencyKey: 'rollback-probe:transaction',
+      payloadHash: 'rollback-probe-payload',
+      walletId: rollbackWalletId,
+      playerId: rollbackPlayerId,
+      roundId: 'rollback-probe-round',
+      gameId: 'rollback-probe-game',
+      kind: WagerTransactionKind.Bet,
+      money: money('1.00'),
+      createdAt: CREATED_AT,
+    });
+    queryLog.length = 0;
+
+    let caught: unknown;
+    try {
+      await unitOfWork.execute(async (repositories) => {
+        await repositories.wallets.add(wallet);
+        await repositories.wagerTransactions.add({
+          transaction: rollbackTransaction,
+          referenceAttempts: -1,
+        });
+      });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(postgresErrorDetails(caught)).toEqual(
+      expect.objectContaining({
+        code: '23514',
+        constraint: 'wager_transactions_reference_attempts_check',
+      }),
+    );
+    expect(
+      queryLog.some((message) => message.includes('insert into "wallets"')),
+    ).toBe(true);
+    expect(
+      queryLog.some((message) => message.includes('insert into "wager_transactions"')),
+    ).toBe(true);
+    expect(queryLog.some((message) => message.includes('rollback'))).toBe(true);
+
+    await unitOfWork.execute(async (repositories) => {
+      expect(await repositories.wallets.findById(rollbackWalletId)).toBeUndefined();
+      expect(
+        await repositories.wagerTransactions.findById(rollbackTransactionId),
+      ).toBeUndefined();
+    });
+  });
+
+  test('reverts every migration and reapplies the complete schema', async () => {
+    await migrateDownCompletely();
+
+    expect(await requiredApplicationOrm().migrator.getExecuted()).toHaveLength(
+      0,
+    );
+    expect(await applicationTableNames()).toEqual([]);
+
+    await requiredApplicationOrm().migrator.up();
+
+    expect(await applicationTableNames()).toEqual([...APPLICATION_TABLES]);
+    expect(
+      await requiredApplicationOrm().migrator.getExecuted(),
+    ).toHaveLength(4);
+  });
+});
