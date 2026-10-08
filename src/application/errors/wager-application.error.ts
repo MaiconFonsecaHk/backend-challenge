@@ -15,3 +15,13 @@ export class ExternalOpeningNotAllowedError extends ApplicationError {
     super('OPENING transactions are internal and cannot be submitted.');
   }
 }
+
+export class IdempotencyConflictError extends ApplicationError {
+  readonly code = 'IDEMPOTENCY_CONFLICT';
+
+  constructor(idempotencyKey: string) {
+    super(
+      `Idempotency key ${idempotencyKey} was already used with a different payload.`,
+    );
+  }
+}

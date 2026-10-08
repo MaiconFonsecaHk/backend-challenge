@@ -1,5 +1,9 @@
 import type { MoneyProps } from '../../domain/shared/value-objects/money.js';
 import type {
+  PersistenceRepositories,
+  WagerTransactionRecord,
+} from './persistence/repositories.js';
+import type {
   WagerTransactionKind,
   WagerTransactionStatus,
 } from '../../domain/wagering/wager-transaction.js';
@@ -44,4 +48,11 @@ export interface WagerTransactionProcessor {
   process(
     command: WagerTransactionProcessingCommand,
   ): Promise<ProcessWagerTransactionResult>;
+}
+
+export interface NewWagerTransactionExecutor {
+  execute(
+    command: WagerTransactionProcessingCommand,
+    repositories: PersistenceRepositories,
+  ): Promise<WagerTransactionRecord>;
 }

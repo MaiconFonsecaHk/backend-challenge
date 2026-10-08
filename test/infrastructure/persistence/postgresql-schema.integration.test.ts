@@ -2,8 +2,20 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { Migrator } from '@mikro-orm/migrations';
 import { MikroORM } from '@mikro-orm/postgresql';
 
+import { IdempotencyConflictError } from '../../../src/application/errors/wager-application.error.js';
 import type { Clock } from '../../../src/application/ports/clock.js';
 import type { IdGenerator } from '../../../src/application/ports/id-generator.js';
+import type {
+  PersistenceRepositories,
+  WagerTransactionRecord,
+} from '../../../src/application/ports/persistence/repositories.js';
+import type {
+  NewWagerTransactionExecutor,
+  WagerTransactionProcessingCommand,
+} from '../../../src/application/ports/wager-transaction-processor.js';
+import { PersistentWagerTransactionProcessor } from '../../../src/application/services/persistent-wager-transaction.processor.js';
+import { WagerPayloadFingerprintService } from '../../../src/application/services/wager-payload-fingerprint.js';
+import { ProcessWagerTransactionUseCase } from '../../../src/application/use-cases/wagering/process-wager-transaction.use-case.js';
 import { CreateWalletUseCase } from '../../../src/application/use-cases/wallet/create-wallet.use-case.js';
 import { GetWalletLedgerUseCase } from '../../../src/application/use-cases/wallet/get-wallet-ledger.use-case.js';
 import { GetWalletUseCase } from '../../../src/application/use-cases/wallet/get-wallet.use-case.js';
@@ -21,11 +33,13 @@ import {
 } from '../../../src/domain/wagering/wager-transaction.js';
 import { Wallet } from '../../../src/domain/wallet/wallet.js';
 import { PERSISTENCE_ENTITIES } from '../../../src/infrastructure/persistence/entities/persistence-entities.js';
+import { Sha256PayloadDigest } from '../../../src/infrastructure/cryptography/sha256-payload-digest.js';
 import { Migration20261007155000Baseline } from '../../../src/infrastructure/persistence/migrations/Migration20261007155000Baseline.js';
 import { Migration20261008015154_create_persistence_tables } from '../../../src/infrastructure/persistence/migrations/Migration20261008015154_create_persistence_tables.js';
 import { Migration20261008021520_enforce_persistence_constraints } from '../../../src/infrastructure/persistence/migrations/Migration20261008021520_enforce_persistence_constraints.js';
 import { Migration20261008023045_add_access_pattern_indexes } from '../../../src/infrastructure/persistence/migrations/Migration20261008023045_add_access_pattern_indexes.js';
 import { MikroOrmUnitOfWork } from '../../../src/infrastructure/persistence/mikro-orm.unit-of-work.js';
+import { MikroOrmPersistenceConflictClassifier } from '../../../src/infrastructure/persistence/mikro-orm-persistence-conflict.classifier.js';
 import { Base64UrlLedgerCursorCodec } from '../../../src/infrastructure/serialization/base64url-ledger-cursor.codec.js';
 
 const APPLICATION_TABLES = [
@@ -78,6 +92,76 @@ class SequenceIdGenerator implements IdGenerator {
 
     this.index += 1;
     return value;
+  }
+}
+
+class ConcurrentLossExecutor implements NewWagerTransactionExecutor {
+  executions = 0;
+  private barrierArrivals = 0;
+  private readonly barrier: Promise<void>;
+  private releaseBarrier: (() => void) | undefined;
+
+  constructor(private readonly barrierSize: number) {
+    this.barrier = new Promise((resolve) => {
+      this.releaseBarrier = resolve;
+    });
+  }
+
+  async execute(
+    command: WagerTransactionProcessingCommand,
+    repositories: PersistenceRepositories,
+  ): Promise<WagerTransactionRecord> {
+    this.executions += 1;
+    if (this.barrierArrivals < this.barrierSize) {
+      this.barrierArrivals += 1;
+      if (this.barrierArrivals === this.barrierSize) {
+        this.releaseBarrier?.();
+      }
+      await this.barrier;
+    }
+
+    const wallet = await repositories.wallets.findById(command.walletId);
+    if (wallet === undefined) {
+      throw new Error('Idempotency integration wallet was not persisted');
+    }
+
+    const transaction = WagerTransaction.create({
+      id: crypto.randomUUID(),
+      providerId: command.providerId,
+      externalTransactionId: command.externalTransactionId,
+      idempotencyKey: command.idempotencyKey,
+      payloadHash: command.payloadHash,
+      walletId: command.walletId,
+      playerId: command.playerId,
+      roundId: command.roundId,
+      gameId: command.gameId,
+      kind: command.kind,
+      money: Money.from(command.money),
+      referenceExternalTransactionId:
+        command.referenceExternalTransactionId,
+      createdAt: CREATED_AT,
+    });
+    transaction.markProcessed(undefined, PROCESSED_AT);
+    const eventId = crypto.randomUUID();
+    await repositories.outboxMessages.add(
+      OutboxMessage.rehydrate({
+        id: eventId,
+        aggregateId: transaction.id,
+        eventType: 'IdempotencyProbeProcessed',
+        payload: {
+          eventId,
+          transactionId: transaction.id,
+        },
+        occurredAt: PROCESSED_AT,
+        attempts: 0,
+      }),
+    );
+
+    return {
+      transaction,
+      resultBalance: wallet.balance,
+      referenceAttempts: 0,
+    };
   }
 }
 
@@ -647,6 +731,108 @@ describePostgreSql('PostgreSQL schema integration', () => {
       consistent: true,
       checkedEntries: 0,
     });
+  });
+
+  test('deduplicates 50 concurrent submissions and preserves the committed result', async () => {
+    const walletId = '10000000-0000-4000-8000-000000000109';
+    const playerId = '20000000-0000-4000-8000-000000000109';
+    const idempotencyKey = 'provider-idempotency:external-109';
+    const unitOfWork = new MikroOrmUnitOfWork(requiredApplicationOrm());
+    await new CreateWalletUseCase(
+      unitOfWork,
+      new SequenceIdGenerator([walletId]),
+      new FixedClock(CREATED_AT),
+    ).execute({
+      playerId,
+      initialBalance: { amount: '0.00', currency: 'BRL' },
+      correlationId: 'wallet-create-integration-109',
+    });
+
+    const executor = new ConcurrentLossExecutor(3);
+    const processor = new PersistentWagerTransactionProcessor(
+      unitOfWork,
+      executor,
+      new MikroOrmPersistenceConflictClassifier(),
+    );
+    const useCase = new ProcessWagerTransactionUseCase(
+      processor,
+      new WagerPayloadFingerprintService(new Sha256PayloadDigest()),
+    );
+    const submission = {
+      providerId: 'provider-idempotency',
+      externalTransactionId: 'external-109',
+      idempotencyKey,
+      playerId,
+      walletId,
+      roundId: 'round-109',
+      gameId: 'game-109',
+      kind: WagerTransactionKind.Loss,
+      money: { amount: '10.00', currency: 'BRL' },
+      correlationId: 'correlation-109',
+    } as const;
+
+    const results = await Promise.all(
+      Array.from({ length: 50 }, () => useCase.execute(submission)),
+    );
+    const transactionIds = new Set(
+      results.map((result) => result.transactionId),
+    );
+
+    expect(transactionIds.size).toBe(1);
+    expect(
+      results.filter((result) => !result.idempotentReplay),
+    ).toHaveLength(1);
+    expect(
+      results.filter((result) => result.idempotentReplay),
+    ).toHaveLength(49);
+    expect(
+      results.every(
+        (result) =>
+          result.status === WagerTransactionStatus.Processed &&
+          result.balance?.amount === '0.00' &&
+          result.balance.currency === 'BRL',
+      ),
+    ).toBe(true);
+    expect(executor.executions).toBeGreaterThanOrEqual(3);
+    const committedTransactionId = results[0]?.transactionId;
+    if (committedTransactionId === undefined) {
+      throw new Error('Concurrent submissions returned no result');
+    }
+
+    const replay = await useCase.execute({
+      ...submission,
+      correlationId: 'another-correlation',
+    });
+    expect(replay).toEqual({
+      transactionId: committedTransactionId,
+      status: WagerTransactionStatus.Processed,
+      balance: { amount: '0.00', currency: 'BRL' },
+      idempotentReplay: true,
+    });
+    await expect(
+      useCase.execute({
+        ...submission,
+        money: { amount: '11.00', currency: 'BRL' },
+      }),
+    ).rejects.toBeInstanceOf(IdempotencyConflictError);
+
+    const [transactionCount] = await requiredApplicationOrm().em
+      .getConnection()
+      .execute<Array<{ count: string }>>(
+        `select count(*)::text as count
+           from wager_transactions
+          where idempotency_key = ?`,
+        [idempotencyKey],
+      );
+    const [outboxCount] = await requiredApplicationOrm().em
+      .getConnection()
+      .execute<Array<{ count: string }>>(
+        `select count(*)::text as count
+           from outbox_messages
+          where event_type = 'IdempotencyProbeProcessed'`,
+      );
+    expect(transactionCount?.count).toBe('1');
+    expect(outboxCount?.count).toBe('1');
   });
 
   test('rolls back every wallet-opening effect when its transaction cannot persist', async () => {
