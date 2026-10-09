@@ -1,0 +1,36 @@
+# Local planning documents
+docs/roadmap.md
+docs/regras-inviolaveis.md
+docs/how_to_commit.md
+
+# Installed dependencies
+node_modules/
+
+# Compiled output and TypeScript caches
+dist/
+*.tsbuildinfo
+
+# Test output
+coverage/
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Logs and runtime files
+*.log
+*.pid
+*.pid.lock
+
+# Tool caches
+.cache/
+.swc/
+
+# IDE settings
+.idea/
+.vscode/
+
+# Operating system metadata
+.DS_Store
+Thumbs.db

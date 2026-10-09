@@ -1,0 +1,68 @@
+import type { MoneyProps } from '../../domain/shared/value-objects/money.js';
+import type {
+  PersistenceRepositories,
+  WagerTransactionRecord,
+} from './persistence/repositories.js';
+import type {
+  WagerTransactionKind,
+  WagerTransactionStatus,
+} from '../../domain/wagering/wager-transaction.js';
+import type { Wallet } from '../../domain/wallet/wallet.js';
+
+export const WAGER_TRANSACTION_PROCESSOR = Symbol(
+  'WAGER_TRANSACTION_PROCESSOR',
+);
+
+export type ExternalWagerTransactionKind = Exclude<
+  WagerTransactionKind,
+  WagerTransactionKind.Opening
+>;
+
+export interface WagerMessageDelivery {
+  readonly consumerName: string;
+  readonly messageId: string;
+  readonly payloadHash: string;
+  readonly receivedAt: Date;
+}
+
+export interface NormalizedWagerTransactionCommand {
+  readonly providerId: string;
+  readonly externalTransactionId: string;
+  readonly idempotencyKey: string;
+  readonly playerId: string;
+  readonly walletId: string;
+  readonly roundId: string;
+  readonly gameId: string;
+  readonly kind: ExternalWagerTransactionKind;
+  readonly money: MoneyProps;
+  readonly referenceExternalTransactionId?: string;
+  readonly correlationId: string;
+  readonly delivery?: WagerMessageDelivery;
+}
+
+export interface WagerTransactionProcessingCommand
+  extends NormalizedWagerTransactionCommand {
+  readonly payloadHash: string;
+}
+
+export interface ProcessWagerTransactionResult {
+  readonly transactionId: string;
+  readonly status: WagerTransactionStatus;
+  readonly balance?: MoneyProps;
+  readonly failureCode?: string;
+  readonly idempotentReplay: boolean;
+}
+
+export interface WagerTransactionProcessor {
+  process(
+    command: WagerTransactionProcessingCommand,
+  ): Promise<ProcessWagerTransactionResult>;
+}
+
+export interface NewWagerTransactionExecutor {
+  execute(
+    command: WagerTransactionProcessingCommand,
+    wallet: Wallet,
+    repositories: PersistenceRepositories,
+  ): Promise<WagerTransactionRecord>;
+}
