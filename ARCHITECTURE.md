@@ -267,13 +267,13 @@ O baseline permanece neutro e prova a cadeia inicial. A migration seguinte cont�
 
 ### D-020 — Consultas retornam snapshots estáveis e o ledger usa cursor composto
 
-- **Status:** confirmada para os casos de uso de consulta, o adapter MikroORM e a codificação do cursor; o contrato HTTP continua para a fase de API.
+- **Status:** confirmada para os casos de uso, adapter MikroORM, codificação e contrato HTTP.
 - **Requisito protegido:** a consulta de wallet precisa devolver o estado materializado sem expor entidades internas, e o histórico do ledger precisa manter ordem determinística e continuidade sem duplicar ou saltar entradas quando timestamps empatam ou novas entradas são inseridas entre páginas.
 - **Alternativas consideradas:** paginação por offset foi rejeitada porque inserções concorrentes deslocam as páginas; cursor apenas por timestamp foi rejeitado porque não ordena empates; cursor apenas por UUID foi rejeitado porque não representa a cronologia; uma consulta de contagem separada foi rejeitada por custo e por abrir outra janela de inconsistência; assinatura ou criptografia do cursor foi adiada porque o requisito atual exige opacidade e validação, não confidencialidade ou proteção criptográfica contra alteração.
 - **Escolha:** `GetWalletUseCase` e `GetWalletLedgerUseCase` retornam DTOs imutáveis com valores monetários em strings decimais e timestamps ISO. O ledger usa keyset pagination em ordem decrescente por `(createdAt, id)`, aplica o predicado estrito anterior ao cursor e solicita `limit + 1` para detectar a próxima página. O cursor contém versão, timestamp e ID em JSON canônico codificado como Base64URL sem padding; formatos não canônicos, versões desconhecidas, timestamps inválidos e estruturas extras são rejeitados com código estável.
-- **Trade-off:** Base64URL impede que o contrato dependa de campos visíveis, mas não é criptografia nem assinatura. Alterações malformadas são rejeitadas, enquanto um cliente pode construir outro cursor estruturalmente válido; isso não concede escrita nem acesso a outra wallet porque `walletId` permanece parâmetro independente da consulta. O valor padrão é `50`; a aplicação exige inteiro positivo e o limite superior do transporte será definido com o contrato HTTP, sem inventar antecipadamente uma política operacional.
+- **Trade-off:** Base64URL impede que o contrato dependa de campos visíveis, mas não é criptografia nem assinatura. Alterações malformadas são rejeitadas, enquanto um cliente pode construir outro cursor estruturalmente válido; isso não concede escrita nem acesso a outra wallet porque `walletId` permanece parâmetro independente da consulta. O valor padrão e máximo HTTP são `50`, usando diretamente o tamanho de página publicado pelo README em vez de criar outro limite operacional sem evidência. A aplicação continua aceitando um limite positivo em sua porta independente de transporte; a borda HTTP restringe o custo público.
 - **Evidência:** testes unitários cobrem wallet existente e ausente, DTOs imutáveis, limite padrão, limites inválidos, `limit + 1`, página final, codec determinístico e rejeição de cursores malformados. O teste com PostgreSQL real cria entradas com o mesmo timestamp, confirma desempate por ID, insere uma entrada mais nova entre páginas e demonstra que a continuação pelo cursor não deriva nem repete resultados; uma consulta nova observa a inserção imediatamente.
-- **Limitação e gatilho de revisão:** validação de UUIDs de rota, limite máximo de página, serialização HTTP e política de status pertencem ao adapter HTTP. Assinatura do cursor só será adicionada se surgir requisito de integridade contra manipulação ou se o cursor passar a carregar informação sensível.
+- **Limitação e gatilho de revisão:** UUIDs, limite, serialização e erro de cursor são validados pelo adapter HTTP. Assinatura do cursor só será adicionada se surgir requisito de integridade contra manipulação ou se o cursor passar a carregar informação sensível; ampliar o limite de `50` exige medição de latência e tamanho de resposta.
 
 ### D-021 — Reconciliação usa um snapshot SQL e nunca corrige estado
 
@@ -359,6 +359,18 @@ O baseline permanece neutro e prova a cadeia inicial. A migration seguinte cont�
 - **Evidência:** testes tabelados cobrem todos os erros de aplicação expostos, exceções HTTP, falhas transitórias de banco e rede, ocultação de detalhes inesperados e os cinco estados da transação. Testes de controller confirmam que o header de idempotência continua sendo a fonte única. A aplicação real registra o filtro global e responde com envelopes uniformes sem mudar os casos de uso.
 - **Limitação e gatilho de revisão:** a mesma taxonomia conceitual deverá ser adaptada para decisões de ack/retry/DLQ do consumer SQS, onde status HTTP não existe. Correlação no envelope, logs e métricas pertencem à fase de observabilidade.
 
+### D-029 — Autenticação externa é adiada atrás de um guard substituível
+
+- **Status:** confirmada para o timebox do desafio; não existe autenticação artesanal.
+- **Requisito protegido:** manter um ponto explícito de autenticação/autorização sem desviar esforço das garantias financeiras e sem proteger endpoints de health.
+- **Alternativas consideradas:** integrar Keycloak ou Zitadel agora foi adiado porque autenticação não pontua e exigiria provisionamento, ciclo de token e testes operacionais adicionais; criar tabela local de usuários e senhas foi rejeitado explicitamente; deixar controllers sem qualquer fronteira foi rejeitado porque tornaria a integração futura difusa; um guard global foi rejeitado porque poderia capturar health por engano.
+- **Escolha:** `DeferredProviderAuthenticationGuard` é aplicado somente aos três controllers financeiros e atualmente permite a requisição sem inspecionar credenciais. Ele é provider do módulo HTTP e constitui o ponto único a ser substituído pela validação de um Identity Provider externo. `HealthController` não possui esse guard.
+- **Fluxo futuro:** o guard validará assinatura, issuer, audience e expiração do bearer token usando metadata/JWKS do IdP; extrairá `sub`, escopos e uma claim de provider; comparará a identidade autorizada com `providerId` presente em rota ou payload antes do caso de uso; e anexará uma identidade imutável ao request para autorização e correlação. Endpoints de wallet exigirão uma claim/escopo que autorize a operação sobre o player ou wallet sem criar uma base local de credenciais.
+- **SQS:** o consumer será um canal interno autenticado pela infraestrutura AWS, mas ainda validará a identidade de provider contida na mensagem e reutilizará as mesmas regras de aplicação. Credenciais de infraestrutura não substituem validação do conteúdo.
+- **Trade-off:** a API financeira permanece aberta no estado atual, o que é uma limitação consciente e documentada. Em troca, o código deixa claro onde a autenticação entra, health permanece público por construção e nenhuma solução de identidade parcial ou insegura compete com os requisitos obrigatórios.
+- **Evidência:** testes de metadata confirmam que todos os controllers financeiros carregam o guard substituível, que o guard adiado permite a execução atual e que `HealthController` não está dentro dessa fronteira.
+- **Limitação e gatilho de revisão:** antes de qualquer exposição fora do ambiente controlado, o guard permissivo deverá ser substituído pela integração real do IdP e por testes de token inválido, claim divergente, escopo insuficiente e rotação de chave.
+
 ## 6. Decisões abertas
 
 Nenhuma alternativa desta tabela está escolhida antecipadamente.
@@ -372,7 +384,6 @@ Nenhuma alternativa desta tabela está escolhida antecipadamente.
 | Retry e backoff | recuperação sem loop infinito | limites, backoff e classificação de erros ainda não definidos | testes de erro transitório, permanente, exaustão e observabilidade |
 | Referência pendente | processar mensagens fora de ordem sem perda | TTL ou máximo de tentativas ainda não definidos | referência posterior, expiração e rejeição terminal auditável |
 | Taxonomia de erros do consumer | workers agirem sem analisar texto | reutilizar as categorias de D-028 sem transportar conceitos de status HTTP para SQS | testes de ack, retry e DLQ por categoria estável |
-| Autenticação | ponto de extensão sem competir com garantias financeiras | IdP externo ou adiamento documentado com porta/guard explícito | integração do IdP ou teste do ponto de extensão; health permanece público |
 | Shutdown de workers | não perder trabalho em andamento | drenagem, extensão/devolução de visibility timeout e ordem de encerramento | `SIGTERM` durante consumo e publicação |
 | Observabilidade | diagnosticar rejeições, retries, DLQ e divergências | formato de logs, correlação e métricas ainda não definidos | testes que confirmem sinais úteis sem expor dados sensíveis |
 
@@ -391,9 +402,9 @@ Nenhum evento pode ser publicado antes do commit. SQS FIFO não substituirá loc
 
 ## 8. Autenticação — estado atual
 
-Autenticação não está implementada e a decisão final entre integrar um Identity Provider ou adiar essa integração permanece aberta. Não será criada tabela própria de usuários ou senha.
+Autenticação foi conscientemente adiada e não existe tabela própria de usuários ou senha. O ponto explícito é `DeferredProviderAuthenticationGuard`, aplicado somente aos controllers financeiros; sua implementação permissiva deverá ser substituída por um adapter de Identity Provider antes de exposição externa.
 
-Se a autenticação for adiada, a arquitetura deverá expor um ponto explícito, como `ProviderIdentityPort` ou um guard substituível. `/health/live` e `/health/ready` continuarão públicos, e a identidade do provider recebida por SQS continuará sujeita às regras do domínio.
+O fluxo futuro, claims e associação com provider estão definidos em D-029. `/health/live` e `/health/ready` permanecem públicos por não carregarem o guard, e a identidade do provider recebida por SQS continuará sujeita à validação do consumer e às regras da aplicação.
 
 ## 9. Evidências reproduzíveis disponíveis
 

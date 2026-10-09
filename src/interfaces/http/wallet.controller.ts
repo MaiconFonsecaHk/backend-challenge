@@ -8,6 +8,7 @@ import {
   Param,
   Post,
   Query,
+  UseGuards,
 } from '@nestjs/common';
 
 import { CreateWalletUseCase } from '../../application/use-cases/wallet/create-wallet.use-case.js';
@@ -15,6 +16,7 @@ import { GetWalletLedgerUseCase } from '../../application/use-cases/wallet/get-w
 import { GetWalletUseCase } from '../../application/use-cases/wallet/get-wallet.use-case.js';
 import { ReconcileWalletUseCase } from '../../application/use-cases/wallet/reconcile-wallet.use-case.js';
 import { resolveCorrelationId } from './correlation-id.js';
+import { DeferredProviderAuthenticationGuard } from './deferred-provider-auth.guard.js';
 import {
   createWalletBodySchema,
   walletIdParamsSchema,
@@ -23,6 +25,7 @@ import {
 import { parseHttpContract } from './http-contract-validation.js';
 
 @Controller('wallets')
+@UseGuards(DeferredProviderAuthenticationGuard)
 export class WalletController {
   constructor(
     private readonly createWallet: CreateWalletUseCase,

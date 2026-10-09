@@ -140,7 +140,14 @@ describe('HTTP contract validation', () => {
       }),
     ).toEqual({ cursor: 'opaque-cursor', limit: 50 });
 
-    for (const limit of ['0', '-1', '1.5', ' 50 ', '9007199254740992']) {
+    for (const limit of [
+      '0',
+      '-1',
+      '1.5',
+      ' 50 ',
+      '51',
+      '9007199254740992',
+    ]) {
       expect(() =>
         parseHttpContract(walletLedgerQuerySchema, { limit }),
       ).toThrow(BadRequestException);

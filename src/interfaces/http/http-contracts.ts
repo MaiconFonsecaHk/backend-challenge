@@ -11,6 +11,8 @@ const nonBlankIdentifierSchema = z
 
 const uuidSchema = z.uuid();
 
+export const MAX_LEDGER_PAGE_LIMIT = 50;
+
 const moneySchema = z
   .object({
     amount: z.string().regex(/^\d+\.\d{2}$/, {
@@ -51,6 +53,9 @@ const ledgerLimitSchema = z
   .transform((value) => Number(value))
   .refine(Number.isSafeInteger, {
     message: 'Limit must be a safe integer.',
+  })
+  .refine((value) => value <= MAX_LEDGER_PAGE_LIMIT, {
+    message: `Limit must not exceed ${MAX_LEDGER_PAGE_LIMIT}.`,
   });
 
 export const walletLedgerQuerySchema = z

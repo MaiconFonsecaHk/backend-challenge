@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { APP_FILTER } from '@nestjs/core';
 
 import { HttpExceptionFilter } from '../interfaces/http/http-exception.filter.js';
+import { DeferredProviderAuthenticationGuard } from '../interfaces/http/deferred-provider-auth.guard.js';
 import {
   ProviderWageringController,
   WageringController,
@@ -13,6 +14,9 @@ import { WalletApplicationModule } from './wallet-application.module.js';
 @Module({
   imports: [WalletApplicationModule, WageringApplicationModule],
   controllers: [WalletController, WageringController, ProviderWageringController],
-  providers: [{ provide: APP_FILTER, useClass: HttpExceptionFilter }],
+  providers: [
+    DeferredProviderAuthenticationGuard,
+    { provide: APP_FILTER, useClass: HttpExceptionFilter },
+  ],
 })
 export class HttpApiModule {}

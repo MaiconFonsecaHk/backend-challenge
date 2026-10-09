@@ -8,6 +8,7 @@ import {
   Param,
   Post,
   Res,
+  UseGuards,
 } from '@nestjs/common';
 
 import {
@@ -16,6 +17,7 @@ import {
 } from '../../application/use-cases/wagering/get-wager-transaction.use-cases.js';
 import { ProcessWagerTransactionUseCase } from '../../application/use-cases/wagering/process-wager-transaction.use-case.js';
 import { resolveCorrelationId } from './correlation-id.js';
+import { DeferredProviderAuthenticationGuard } from './deferred-provider-auth.guard.js';
 import {
   idempotencyKeyHeaderSchema,
   processWagerBodySchema,
@@ -29,6 +31,7 @@ import {
 } from './wager-http-response.js';
 
 @Controller('wagering/transactions')
+@UseGuards(DeferredProviderAuthenticationGuard)
 export class WageringController {
   constructor(
     private readonly processWagerTransaction: ProcessWagerTransactionUseCase,
@@ -70,6 +73,7 @@ export class WageringController {
 }
 
 @Controller('providers/:providerId/wagering/transactions')
+@UseGuards(DeferredProviderAuthenticationGuard)
 export class ProviderWageringController {
   constructor(
     private readonly getProviderWagerTransaction: GetProviderWagerTransactionUseCase,
