@@ -10,6 +10,171 @@ Não esperamos perfeição — esperamos raciocínio claro, código limpo e deci
 
 ---
 
+## Solução implementada
+
+Este repositório contém uma implementação completa dos requisitos obrigatórios descritos no enunciado abaixo. O texto original do desafio permanece preservado como fonte de verdade; as decisões adotadas, alternativas, trade-offs e evidências estão registradas em [`ARCHITECTURE.md`](./ARCHITECTURE.md).
+
+### Visão rápida
+
+```text
+HTTP ───────────────┐
+                    ├─> casos de uso ─> Unit of Work ─> PostgreSQL
+SQS FIFO ─> inbox ──┘                        │              │
+                                            │              ├─ wallet
+                                            │              ├─ transaction
+                                            │              ├─ ledger
+                                            │              ├─ inbox
+                                            │              └─ outbox
+                                            │
+                                            └─ commit antes de qualquer ack/publicação
+
+outbox confirmada ─> publisher concorrente ─> SQS FIFO
+referência pendente ─> worker com backoff/TTL ─> sucesso ou rejeição auditável
+```
+
+O domínio e a aplicação não dependem de NestJS, MikroORM ou AWS SDK. PostgreSQL é a autoridade para idempotência, locks e invariantes persistentes. HTTP e SQS reutilizam o mesmo caso de uso financeiro.
+
+### Pré-requisitos
+
+- Bun `1.4.2`;
+- Docker com Docker Compose v2;
+- portas locais `3000`, `5432` e `4566` livres, ou valores alternativos configurados no `.env`.
+
+Não é necessário instalar PostgreSQL ou SQS diretamente na máquina. O Compose inicia PostgreSQL e MiniStack em containers.
+
+### Inicialização local
+
+1. Crie o arquivo de ambiente a partir do exemplo:
+
+   ```powershell
+   Copy-Item .env.example .env
+   ```
+
+   Em shells POSIX, use `cp .env.example .env`.
+
+2. Instale exatamente as dependências travadas:
+
+   ```bash
+   bun install --frozen-lockfile
+   ```
+
+3. Inicie e aguarde a infraestrutura ficar saudável:
+
+   ```bash
+   docker compose up -d --wait
+   ```
+
+4. Aplique as migrations:
+
+   ```bash
+   bun run migration:up
+   ```
+
+5. Inicie a API, o consumer SQS e os workers:
+
+   ```bash
+   bun run start:dev
+   ```
+
+   Para executar sem watch, use `bun run start`.
+
+6. Confirme liveness e readiness:
+
+   ```bash
+   curl http://127.0.0.1:3000/health/live
+   curl http://127.0.0.1:3000/health/ready
+   ```
+
+   Liveness comprova que o processo responde. Readiness só retorna sucesso quando PostgreSQL e SQS estão disponíveis.
+
+Para encerrar os containers preservando o volume do PostgreSQL:
+
+```bash
+docker compose down
+```
+
+### Configuração
+
+O `.env.example` contém somente valores locais de desenvolvimento. Credenciais reais não devem ser versionadas.
+
+| Grupo | Variáveis | Responsabilidade |
+| --- | --- | --- |
+| Processo | `NODE_ENV`, `PORT` | ambiente e porta HTTP |
+| PostgreSQL | `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` | conexão e configuração do container |
+| AWS/SQS | `AWS_REGION`, credenciais AWS opcionais, `SQS_ENDPOINT` e nomes das três filas | conexão, consumo, DLQ e publicação de eventos |
+| Consumer | `SQS_MAX_RECEIVE_COUNT`, `SQS_VISIBILITY_TIMEOUT_SECONDS`, `SQS_MAX_RETRY_VISIBILITY_SECONDS` | limite e backoff de redelivery |
+| Outbox | `OUTBOX_BATCH_SIZE`, `OUTBOX_POLL_INTERVAL_MS`, `OUTBOX_RETRY_BASE_SECONDS`, `OUTBOX_RETRY_MAX_SECONDS` | lote, polling e retry do publisher |
+| Referências | `PENDING_REFERENCE_BATCH_SIZE`, `PENDING_REFERENCE_POLL_INTERVAL_MS`, `PENDING_REFERENCE_RETRY_BASE_SECONDS`, `PENDING_REFERENCE_RETRY_MAX_SECONDS`, `PENDING_REFERENCE_TTL_SECONDS` | reprocessamento e expiração de referências fora de ordem |
+
+Se a porta publicada do MiniStack mudar por conflito com outro projeto Docker, altere `MINISTACK_PORT` e faça `SQS_ENDPOINT` apontar para a mesma porta. Os limites de retry, backoff e TTL são validados no startup; configurações incompatíveis impedem uma inicialização silenciosamente incorreta.
+
+### Migrations
+
+```bash
+bun run migration:pending
+bun run migration:list
+bun run migration:up
+bun run migration:down
+```
+
+`migration:down` reverte a última migration e deve ser usado conscientemente em ambientes com dados. A suíte PostgreSQL executa o ciclo completo de aplicação, reversão e reaplicação em um banco temporário isolado.
+
+### Verificação
+
+```bash
+bun run typecheck
+bun run build
+bun run test
+bun run test:integration:postgres
+bun run test:integration:sqs
+```
+
+`bun run test` executa a suíte normal e ignora deliberadamente os casos que exigem containers. As duas suítes de integração são comandos separados para deixar explícito quando PostgreSQL e SQS reais serão utilizados.
+
+Na baseline documentada:
+
+- `bun run test`: 424 testes aprovados;
+- `bun run test:integration:postgres`: 21 testes aprovados;
+- `bun run test:integration:sqs`: 4 testes aprovados;
+- type-check e build aprovados.
+
+As provas incluem 50 replays paralelos da mesma aposta, disputa simultânea de duas apostas de `80.00 BRL` contra `100.00 BRL`, três instâncias independentes, wallets distintas em paralelo, dois publishers, redelivery depois de commit e antes do ack, referência entregue fora de ordem e morte abrupta de um processo com retomada do claim da outbox.
+
+### Endpoints
+
+| Método | Rota | Finalidade |
+| --- | --- | --- |
+| `POST` | `/wallets` | criar wallet e, quando necessário, `OPENING` atômico |
+| `GET` | `/wallets/:walletId` | consultar wallet |
+| `GET` | `/wallets/:walletId/ledger?cursor=...&limit=50` | paginar ledger com cursor opaco |
+| `POST` | `/wallets/:walletId/reconciliation` | comparar saldo materializado e ledger sem corrigir dados |
+| `POST` | `/wagering/transactions` | processar `BET`, `WIN`, `LOSS`, `REFUND` ou `ROLLBACK` |
+| `GET` | `/wagering/transactions/:transactionId` | consultar por identidade interna |
+| `GET` | `/providers/:providerId/wagering/transactions/:externalTransactionId` | consultar pela identidade do provider |
+| `GET` | `/health/live` | liveness público |
+| `GET` | `/health/ready` | readiness público de PostgreSQL e SQS |
+| `GET` | `/metrics` | métricas Prometheus públicas |
+
+Submissões HTTP de wagering exigem o header `Idempotency-Key`. `X-Correlation-Id` é aceito quando não vazio; caso seja omitido, o serviço gera um UUID e o devolve na resposta. Dinheiro sempre usa string decimal com duas casas, por exemplo `{ "amount": "80.00", "currency": "BRL" }`.
+
+### Execução com múltiplas instâncias
+
+Cada processo deve receber uma porta HTTP diferente e apontar para o mesmo PostgreSQL e as mesmas filas. Não existe estado de correção mantido apenas em memória: locks por linha, constraints, inbox e idempotência persistente coordenam as instâncias. Métricas são mantidas por processo e devem ser agregadas pelo backend Prometheus.
+
+### Garantias e limitações conhecidas
+
+- A outbox oferece entrega pelo menos uma vez; duplicidade é possível se o envio ao SQS ocorrer antes de uma falha que impeça a marcação no PostgreSQL. Os consumidores devem permanecer idempotentes.
+- A autenticação foi deliberadamente adiada porque não pontua no desafio. Existe um guard substituível, atualmente permissivo, e o desenho para um Identity Provider externo está em `ARCHITECTURE.md`. A API não deve ser exposta publicamente nesse estado.
+- MiniStack comprova o protocolo local usado pela integração, mas não substitui validação operacional em uma conta AWS real.
+- As métricas não incluem dashboards ou OpenTelemetry; ambos são diferenciais opcionais.
+- Não foi criado teste de carga. As provas determinísticas dos requisitos obrigatórios foram priorizadas.
+
+---
+
+## Enunciado original
+
+---
+
 ## 1. Visão geral
 
 Construa um serviço financeiro distribuído que processe transações de apostas recebidas de múltiplos provedores de jogos.

@@ -1,8 +1,11 @@
 import { Migrator } from '@mikro-orm/migrations';
 import { defineConfig } from '@mikro-orm/postgresql';
+import { config as loadEnvironment } from 'dotenv';
 
 import { databaseEnvironmentSchema } from '../../config/environment.schema.js';
 import { PERSISTENCE_ENTITIES } from './entities/persistence-entities.js';
+
+loadEnvironment({ quiet: true });
 
 const environment = databaseEnvironmentSchema.parse(process.env);
 
