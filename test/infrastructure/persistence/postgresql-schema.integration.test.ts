@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { afterAll, afterEach, beforeAll, describe, expect, test } from 'bun:test';
 import { Migrator } from '@mikro-orm/migrations';
 import { MikroORM } from '@mikro-orm/postgresql';
 
@@ -86,6 +86,10 @@ interface PostgreSqlErrorDetails {
 
 interface TableNameRow {
   readonly table_name: string;
+}
+
+interface DivergentWalletRow {
+  readonly id: string;
 }
 
 class FixedClock implements Clock {
@@ -393,6 +397,64 @@ async function migrateDownCompletely(): Promise<void> {
   throw new Error('Migration rollback exceeded the expected safety limit');
 }
 
+function spawnOutboxCrashWorker(now: Date) {
+  return Bun.spawn(
+    [
+      process.execPath,
+      'run',
+      'test/fixtures/postgresql-crash-worker.ts',
+    ],
+    {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        CRASH_TEST_DATABASE: databaseName,
+        CRASH_TEST_NOW: now.toISOString(),
+      },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    },
+  );
+}
+
+async function waitForWorkerSignal(
+  worker: ReturnType<typeof spawnOutboxCrashWorker>,
+  expected: string,
+): Promise<void> {
+  const reader = worker.stdout.getReader();
+  const decoder = new TextDecoder();
+  let output = '';
+  const deadline = Date.now() + 10_000;
+
+  try {
+    while (!output.includes(expected)) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        throw new Error(`Crash worker did not emit ${expected}. Output: ${output}`);
+      }
+      let timeoutId: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<never>((_, reject) => {
+        timeoutId = setTimeout(
+          () => reject(new Error(`Crash worker timed out waiting for ${expected}.`)),
+          remaining,
+        );
+      });
+      const chunk = await Promise.race([reader.read(), timeout]).finally(() => {
+        clearTimeout(timeoutId);
+      });
+      if (chunk.done) {
+        const stderr = await new Response(worker.stderr).text();
+        throw new Error(
+          `Crash worker exited before ${expected}. Output: ${output}. Error: ${stderr}`,
+        );
+      }
+      output += decoder.decode(chunk.value, { stream: true });
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 async function persistCompleteOpening(): Promise<void> {
   const wallet = Wallet.open({
     id: WALLET_ID,
@@ -524,6 +586,33 @@ describePostgreSql('PostgreSQL schema integration', () => {
       await administrationOrm.close(true);
       administrationOrm = undefined;
     }
+  });
+
+  afterEach(async () => {
+    if (applicationOrm === undefined) {
+      return;
+    }
+
+    const tables = await applicationTableNames();
+    if (!tables.includes('wallets')) {
+      return;
+    }
+
+    const divergent = await applicationOrm.em.getConnection().execute<
+      DivergentWalletRow[]
+    >(
+      `select wallet.id
+         from wallets wallet
+         left join wallet_ledger_entries ledger on ledger.wallet_id = wallet.id
+        group by wallet.id, wallet.balance
+       having wallet.balance <> coalesce(sum(
+         case ledger.direction
+           when 'CREDIT' then ledger.amount
+           when 'DEBIT' then -ledger.amount
+         end
+       ), 0)`,
+    );
+    expect(divergent).toEqual([]);
   });
 
   test('applies every migration to a clean database', async () => {
@@ -802,6 +891,58 @@ describePostgreSql('PostgreSQL schema integration', () => {
       '2026-10-08T12:01:05.000Z',
     );
   });
+
+  test('another publisher recovers an outbox claim after the worker process crashes', async () => {
+    const eventId = '50000000-0000-4000-8000-000000000932';
+    const aggregateId = '10000000-0000-4000-8000-000000000932';
+    const crashInstant = new Date('2026-10-08T12:02:00.000Z');
+    const unitOfWork = new MikroOrmUnitOfWork(requiredApplicationOrm());
+    await unitOfWork.execute(async (repositories) => {
+      await repositories.outboxMessages.add(
+        OutboxMessage.rehydrate({
+          id: eventId,
+          aggregateId,
+          eventType: 'OutboxCrashRecoveryProbe',
+          payload: { eventId },
+          occurredAt: new Date('2000-01-01T00:00:00.000Z'),
+          attempts: 0,
+        }),
+      );
+    });
+
+    const worker = spawnOutboxCrashWorker(crashInstant);
+    try {
+      await waitForWorkerSignal(worker, `CLAIMED:${eventId}`);
+    } finally {
+      worker.kill();
+      await worker.exited;
+    }
+
+    const publications: OutboxEventPublication[] = [];
+    const publisher = new PublishOutboxBatchUseCase(
+      unitOfWork,
+      {
+        publish: async (event) => {
+          publications.push(event);
+        },
+      },
+      new FixedClock(crashInstant),
+      new ExponentialOutboxRetryPolicy(5, 300),
+    );
+
+    expect(await publisher.execute(1)).toEqual({
+      claimed: 1,
+      published: 1,
+      failed: 0,
+    });
+    expect(publications.map((event) => event.id)).toEqual([eventId]);
+    const recovered = await unitOfWork.execute((repositories) =>
+      repositories.outboxMessages.findById(eventId),
+    );
+    expect(recovered?.publishedAt?.toISOString()).toBe(
+      crashInstant.toISOString(),
+    );
+  }, 20_000);
 
   test('recovers a refund delivered before its reference without breaking ledger consistency', async () => {
     const walletId = '10000000-0000-4000-8000-000000000931';
@@ -1294,6 +1435,12 @@ describePostgreSql('PostgreSQL schema integration', () => {
       balance: { amount: '41.00', currency: 'BRL' },
       version: 6,
     });
+    await requiredApplicationOrm().em.getConnection().execute(
+      `update wallets
+          set balance = ?, version = version + 1, updated_at = ?
+        where id = ?`,
+      ['40.00', new Date('2026-10-08T13:03:00.000Z'), walletId],
+    );
   });
 
   test('reconciles a persisted zero-balance wallet without ledger entries', async () => {
