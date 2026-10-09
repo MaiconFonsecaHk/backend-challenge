@@ -100,6 +100,42 @@ describe('SQS wager consumer', () => {
     expect(recordRetry).toHaveBeenCalledWith('sqs_wager_consumer');
   });
 
+  test('stops only the failed FIFO group after a transient error', async () => {
+    const commands: unknown[] = [];
+    const handled: string[] = [];
+    const consumer = consumerHarness(commands, async (body) => {
+      handled.push(body ?? '');
+      if (body === 'wallet-a-first') {
+        throw Object.assign(new Error('temporary timeout'), {
+          code: 'ETIMEDOUT',
+        });
+      }
+    });
+
+    await processBatch(consumer, [
+      message('message-a1', 'wallet-a', 'wallet-a-first'),
+      message('message-a2', 'wallet-a', 'wallet-a-second'),
+      message('message-b1', 'wallet-b', 'wallet-b-first'),
+    ]);
+
+    expect(handled).toEqual(['wallet-a-first', 'wallet-b-first']);
+    expect(
+      commands.filter(
+        (command) => command instanceof ChangeMessageVisibilityCommand,
+      ),
+    ).toHaveLength(1);
+    expect(
+      commands.filter((command) => command instanceof DeleteMessageCommand),
+    ).toHaveLength(1);
+    expect(
+      commands.some(
+        (command) =>
+          command instanceof DeleteMessageCommand &&
+          command.input.ReceiptHandle === 'receipt-message-a2',
+      ),
+    ).toBeFalse();
+  });
+
   test('leaves an exhausted transient message for native redrive', async () => {
     const commands: unknown[] = [];
     const consumer = consumerHarness(commands, async () => {
@@ -146,6 +182,27 @@ describe('SQS wager consumer', () => {
       retryable: false,
     });
     expect(recordDeadLetterMessage).toHaveBeenCalledTimes(1);
+  });
+
+  test('continues a FIFO group after a permanent message is moved to the DLQ', async () => {
+    const commands: unknown[] = [];
+    const handled: string[] = [];
+    const consumer = consumerHarness(commands, async (body) => {
+      handled.push(body ?? '');
+      if (body === 'invalid-first') {
+        throw new InvalidSqsWagerMessageError();
+      }
+    });
+
+    await processBatch(consumer, [
+      message('message-invalid', 'wallet-a', 'invalid-first'),
+      message('message-valid', 'wallet-a', 'valid-second'),
+    ]);
+
+    expect(handled).toEqual(['invalid-first', 'valid-second']);
+    expect(commands[0]).toBeInstanceOf(SendMessageCommand);
+    expect(commands[1]).toBeInstanceOf(DeleteMessageCommand);
+    expect(commands[2]).toBeInstanceOf(DeleteMessageCommand);
   });
 
   test('leaves a successfully processed message for redelivery when its ack fails', async () => {

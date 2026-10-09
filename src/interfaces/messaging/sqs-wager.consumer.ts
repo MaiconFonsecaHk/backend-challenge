@@ -120,16 +120,21 @@ export class SqsWagerConsumer
     await Promise.all(
       [...groups.values()].map(async (group) => {
         for (const message of group) {
-          await this.processMessage(message);
+          const outcome = await this.processMessage(message);
+          if (outcome === 'STOP_GROUP') {
+            break;
+          }
         }
       }),
     );
   }
 
-  private async processMessage(message: Message): Promise<void> {
+  private async processMessage(
+    message: Message,
+  ): Promise<'CONTINUE' | 'STOP_GROUP'> {
     const receiptHandle = message.ReceiptHandle;
     if (receiptHandle === undefined) {
-      return;
+      return 'STOP_GROUP';
     }
 
     try {
@@ -140,15 +145,16 @@ export class SqsWagerConsumer
     } catch (error) {
       if (isTransientWagerMessageError(error)) {
         await this.scheduleRetry(message, receiptHandle);
-        return;
+        return 'STOP_GROUP';
       }
 
       await this.moveToDeadLetterQueue(message);
       await this.deleteMessage(receiptHandle);
-      return;
+      return 'CONTINUE';
     }
 
     await this.deleteMessage(receiptHandle);
+    return 'CONTINUE';
   }
 
   private async scheduleRetry(

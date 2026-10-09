@@ -190,6 +190,45 @@ describeSqs('SQS wager consumer integration', () => {
     expect(await receive(queueUrl, 1)).toBeUndefined();
   }, 20_000);
 
+  test('does not advance a FIFO group after its first message fails transiently', async () => {
+    const groupId = 'wallet-ordered-retry';
+    const firstBody = '{"sequence":1}';
+    const secondBody = '{"sequence":2}';
+    await send(firstBody, groupId, 'ordered-retry-1');
+    await send(secondBody, groupId, 'ordered-retry-2');
+    const batch = await receiveBatchRequired(queueUrl, 2);
+    expect(batch.map((message) => message.Body)).toEqual([
+      firstBody,
+      secondBody,
+    ]);
+
+    const handled: string[] = [];
+    let failFirst = true;
+    const consumer = consumerHarness(requiredClient(), async (body) => {
+      handled.push(body ?? '');
+      if (body === firstBody && failFirst) {
+        failFirst = false;
+        throw Object.assign(new Error('simulated database timeout'), {
+          code: 'ETIMEDOUT',
+        });
+      }
+    });
+
+    await processBatch(consumer, batch);
+    expect(handled).toEqual([firstBody]);
+
+    const firstRedelivery = await receiveRequired(queueUrl, 8_000);
+    expect(firstRedelivery.Body).toBe(firstBody);
+    expect(firstRedelivery.Attributes?.ApproximateReceiveCount).toBe('2');
+    await processBatch(consumer, [firstRedelivery]);
+
+    const secondDelivery = await receiveRequired(queueUrl, 8_000);
+    expect(secondDelivery.Body).toBe(secondBody);
+    await processBatch(consumer, [secondDelivery]);
+    expect(handled).toEqual([firstBody, firstBody, secondBody]);
+    expect(await receive(queueUrl, 1)).toBeUndefined();
+  }, 20_000);
+
   test('publishes an outbox envelope with aggregate ordering and event deduplication', async () => {
     const eventId = '50000000-0000-4000-8000-000000000811';
     const aggregateId = '10000000-0000-4000-8000-000000000811';
@@ -232,7 +271,10 @@ function requiredClient(): SQSClient {
 
 function consumerHarness(
   sqsClient: SQSClient,
-  handle: () => Promise<unknown>,
+  handle: (
+    body?: string,
+    messageGroupId?: string,
+  ) => Promise<unknown>,
 ): SqsWagerConsumer {
   const values: Partial<EnvironmentVariables> = {
     SQS_MAX_RECEIVE_COUNT: MAX_RECEIVE_COUNT,
@@ -314,6 +356,34 @@ async function receiveRequired(
   } while (Date.now() < deadline);
 
   throw new Error(`No SQS message arrived at ${targetQueueUrl}.`);
+}
+
+async function receiveBatchRequired(
+  targetQueueUrl: string,
+  expectedCount: number,
+  timeoutMilliseconds = 5_000,
+): Promise<readonly Message[]> {
+  const deadline = Date.now() + timeoutMilliseconds;
+  do {
+    const response = await requiredClient().send(
+      new ReceiveMessageCommand({
+        QueueUrl: targetQueueUrl,
+        MaxNumberOfMessages: expectedCount,
+        WaitTimeSeconds: 1,
+        MessageSystemAttributeNames: [
+          'ApproximateReceiveCount',
+          'MessageGroupId',
+        ],
+      }),
+    );
+    if (response.Messages?.length === expectedCount) {
+      return response.Messages;
+    }
+  } while (Date.now() < deadline);
+
+  throw new Error(
+    `SQS did not return a batch of ${expectedCount} messages from ${targetQueueUrl}.`,
+  );
 }
 
 async function waitForNativeRedrive(): Promise<Message> {
