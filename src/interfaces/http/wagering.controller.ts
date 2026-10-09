@@ -1,4 +1,14 @@
-import { Body, Controller, Get, Headers, Param, Post } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  Headers,
+  HttpCode,
+  HttpStatus,
+  Param,
+  Post,
+  Res,
+} from '@nestjs/common';
 
 import {
   GetProviderWagerTransactionUseCase,
@@ -13,6 +23,10 @@ import {
   transactionIdParamsSchema,
 } from './http-contracts.js';
 import { parseHttpContract } from './http-contract-validation.js';
+import {
+  type HttpStatusResponse,
+  respondWithWagerResult,
+} from './wager-http-response.js';
 
 @Controller('wagering/transactions')
 export class WageringController {
@@ -22,10 +36,12 @@ export class WageringController {
   ) {}
 
   @Post()
-  process(
+  @HttpCode(HttpStatus.OK)
+  async process(
     @Body() body: unknown,
     @Headers('idempotency-key') idempotencyKeyHeader: unknown,
     @Headers('x-correlation-id') correlationIdHeader: unknown,
+    @Res({ passthrough: true }) response: HttpStatusResponse,
   ) {
     const command = parseHttpContract(processWagerBodySchema, body);
     const idempotencyKey = parseHttpContract(
@@ -33,11 +49,13 @@ export class WageringController {
       idempotencyKeyHeader,
     );
 
-    return this.processWagerTransaction.execute({
+    const result = await this.processWagerTransaction.execute({
       ...command,
       idempotencyKey,
       correlationId: resolveCorrelationId(correlationIdHeader),
     });
+
+    return respondWithWagerResult(response, result);
   }
 
   @Get(':transactionId')

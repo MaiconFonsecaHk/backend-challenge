@@ -1,4 +1,14 @@
-import { Body, Controller, Get, Headers, Param, Post, Query } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  Headers,
+  HttpCode,
+  HttpStatus,
+  Param,
+  Post,
+  Query,
+} from '@nestjs/common';
 
 import { CreateWalletUseCase } from '../../application/use-cases/wallet/create-wallet.use-case.js';
 import { GetWalletLedgerUseCase } from '../../application/use-cases/wallet/get-wallet-ledger.use-case.js';
@@ -50,6 +60,7 @@ export class WalletController {
   }
 
   @Post(':walletId/reconciliation')
+  @HttpCode(HttpStatus.OK)
   reconcile(@Param() params: unknown) {
     const { walletId } = parseHttpContract(walletIdParamsSchema, params);
 

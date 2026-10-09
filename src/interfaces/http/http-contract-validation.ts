@@ -27,6 +27,7 @@ export function parseHttpContract<Schema extends z.ZodType>(
   throw new BadRequestException({
     code: INVALID_HTTP_CONTRACT,
     message: 'The request does not match the expected HTTP contract.',
+    retryable: false,
     issues,
   });
 }

@@ -1,4 +1,5 @@
 import { describe, expect, mock, test } from 'bun:test';
+import { HttpStatus } from '@nestjs/common';
 import type { CreateWalletUseCase } from '../../../src/application/use-cases/wallet/create-wallet.use-case.js';
 import type { GetWalletLedgerUseCase } from '../../../src/application/use-cases/wallet/get-wallet-ledger.use-case.js';
 import type { GetWalletUseCase } from '../../../src/application/use-cases/wallet/get-wallet.use-case.js';
@@ -70,6 +71,7 @@ describe('HTTP controllers', () => {
       idempotentReplay: false,
     }));
     const controller = wageringController(execute);
+    const setStatus = mock(() => undefined);
 
     await controller.process(
       {
@@ -84,6 +86,7 @@ describe('HTTP controllers', () => {
       },
       'provider-a:transaction-123',
       'correlation-2',
+      { status: setStatus },
     );
 
     expect(execute).toHaveBeenCalledWith({
@@ -98,6 +101,7 @@ describe('HTTP controllers', () => {
       idempotencyKey: 'provider-a:transaction-123',
       correlationId: 'correlation-2',
     });
+    expect(setStatus).toHaveBeenCalledWith(HttpStatus.OK);
   });
 
   test('delegates both transaction lookup routes', async () => {

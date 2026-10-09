@@ -52,7 +52,7 @@ AppModule
     └── SQS health indicator ── AWS SDK v3 ── MiniStack/SQS
 ```
 
-Ainda não existem endpoints financeiros, consumidor SQS ou workers. O domínio puro da Fase 2 contém `Money`, `Wallet`, `WagerTransaction`, `WalletLedgerEntry`, os modelos de inbox/outbox e os eventos de integração. A infraestrutura materializa os cinco modelos persistentes com constraints, índices, mappers, repositórios e Unit of Work transacional. A aplicação possui os casos de uso de criação, consulta e reconciliação de wallet, consulta paginada do ledger e uma entrada única e independente de transporte para submissões de wagering. Essa entrada normaliza o comando, calcula seu hash canônico e passa por um processador de idempotência persistente que serializa operações de saldo por wallet. O executor das regras financeiras continua desacoplado até que todas as operações sejam implementadas com suas provas próprias.
+Os endpoints financeiros e de consulta já expõem os casos de uso por uma borda HTTP validada; consumidor SQS e workers ainda não existem. O domínio puro da Fase 2 contém `Money`, `Wallet`, `WagerTransaction`, `WalletLedgerEntry`, os modelos de inbox/outbox e os eventos de integração. A infraestrutura materializa os cinco modelos persistentes com constraints, índices, mappers, repositórios e Unit of Work transacional. A aplicação possui os casos de uso de criação, consulta e reconciliação de wallet, consulta paginada do ledger e uma entrada única e independente de transporte para submissões de wagering. Essa entrada normaliza o comando, calcula seu hash canônico e passa por um processador de idempotência persistente que serializa operações de saldo por wallet e executa todas as regras financeiras com seus efeitos atômicos.
 
 ## 4. Boundaries e dependências
 
@@ -346,7 +346,18 @@ O baseline permanece neutro e prova a cadeia inicial. A migration seguinte cont�
 - **Escolha:** `GetWagerTransactionByIdUseCase` e `GetProviderWagerTransactionUseCase` usam os acessos já indexados do repositório e passam pelo mesmo serializador. O snapshot contém identidades públicas de transação, wallet e player, contexto de rodada/jogo, `kind`, `status`, `money`, saldo observado, referências, `failureCode` e timestamps ISO-8601 aplicáveis. Campos opcionais ausentes são omitidos, valores monetários e o objeto externo são congelados, e ambos os caminhos usam `WAGER_TRANSACTION_NOT_FOUND` sem incluir a identidade consultada na mensagem.
 - **Trade-off:** o snapshot é deliberadamente mais rico que a resposta de submissão, mas continua independente de HTTP e de detalhes do ORM. Omitir hash, chave de idempotência e agenda de retry reduz acoplamento e exposição; ferramentas operacionais futuras poderão ter uma consulta administrativa separada. O GET não carrega `idempotentReplay`, pois leitura não reaplica uma operação e esse indicador só descreve uma submissão deduplicada.
 - **Evidência:** cinco testes unitários demonstram igualdade contratual entre as duas identidades, imutabilidade profunda, omissão de campos internos, representação correta de processada, rejeitada e pendente e erro único de ausência. No PostgreSQL real, os dois caminhos reidratam o mesmo `BET` processado, e consultas adicionais preservam o código de uma reversão rejeitada e a ausência de `processedAt` em uma referência pendente.
-- **Limitação e gatilho de revisão:** validação sintática de parâmetros, autorização do provider, serialização HTTP e política uniforme de status ainda serão implementadas nos controllers da Fase 6. Essa borda deve adaptar estes resultados e erros sem criar um segundo formato financeiro.
+- **Limitação e gatilho de revisão:** validação sintática, serialização e política uniforme de status foram concluídas na borda HTTP. A autorização do provider continua aberta e será tratada por um ponto de extensão explícito sem alterar o snapshot financeiro.
+
+### D-028 — A API usa status, código e retryability como taxonomia pública
+
+- **Status:** confirmada para todos os endpoints HTTP financeiros e de consulta.
+- **Requisito protegido:** o provedor precisa distinguir payload inválido, ausência, conflito, rejeição, pendência, falha transitória e falha permanente sem analisar texto livre nem receber detalhes internos sensíveis.
+- **Alternativas consideradas:** responder `200` para todo resultado foi rejeitado porque esconderia rejeição e pendência; lançar `400` para qualquer falha foi rejeitado porque induziria decisões erradas de retry; expor diretamente exceções de domínio, ORM ou framework foi rejeitado por acoplamento e risco de vazamento; usar apenas uma flag no corpo foi rejeitado porque intermediários e clientes HTTP precisam de semântica de status; definir `Retry-After` agora foi rejeitado porque ainda não existe uma política operacional de backoff comprovada.
+- **Escolha:** um filtro global transforma falhas em um envelope com `statusCode`, `code`, `message` e `retryable`, preservando `issues` somente para violações de contrato. Contrato inválido usa `400`; recurso ausente, `404`; conflito de recurso ou idempotência, `409`; rejeição financeira persistida, `422`; `PENDING` e `PENDING_REFERENCE`, `202`; indisponibilidade, deadlock, lock timeout e erros de rede transitórios conhecidos, `503` com `retryable: true`; falhas inesperadas ou permanentes, `500` com mensagem genérica e `retryable: false`. Criação de wallet usa `201`, consultas e reconciliação usam `200`.
+- **Replay e falha terminal:** uma submissão processada retorna `200` tanto na execução original quanto no replay; uma rejeição retorna `422` nos dois casos; uma pendência retorna `202`. Assim o status semântico original é preservado junto de `idempotentReplay`. Um resultado `FAILED` vira erro estável não retentável, mantendo seu `failureCode` como código público quando disponível.
+- **Trade-off:** `422` representa rejeição de regra de negócio mesmo quando o resultado foi persistido com sucesso; isso separa claramente a decisão financeira de uma falha técnica. `503` autoriza retry, mas não informa intervalo até que a política de backoff seja decidida com os consumers. Exceções de domínio inesperadas são tratadas como `500`, pois alcançar a borda depois da validação indica quebra interna e não um payload que o cliente deva tentar corrigir.
+- **Evidência:** testes tabelados cobrem todos os erros de aplicação expostos, exceções HTTP, falhas transitórias de banco e rede, ocultação de detalhes inesperados e os cinco estados da transação. Testes de controller confirmam que o header de idempotência continua sendo a fonte única. A aplicação real registra o filtro global e responde com envelopes uniformes sem mudar os casos de uso.
+- **Limitação e gatilho de revisão:** a mesma taxonomia conceitual deverá ser adaptada para decisões de ack/retry/DLQ do consumer SQS, onde status HTTP não existe. Correlação no envelope, logs e métricas pertencem à fase de observabilidade.
 
 ## 6. Decisões abertas
 
@@ -360,7 +371,7 @@ Nenhuma alternativa desta tabela está escolhida antecipadamente.
 | Ordenação FIFO | preservar paralelismo por wallet sem torná-lo garantia final | `MessageGroupId` por wallet e deduplicação do broker como otimização | mesma wallet serializada, wallets distintas paralelas e redelivery |
 | Retry e backoff | recuperação sem loop infinito | limites, backoff e classificação de erros ainda não definidos | testes de erro transitório, permanente, exaustão e observabilidade |
 | Referência pendente | processar mensagens fora de ordem sem perda | TTL ou máximo de tentativas ainda não definidos | referência posterior, expiração e rejeição terminal auditável |
-| Taxonomia de erros de transporte | clientes e workers agirem sem analisar texto | códigos financeiros de D-026 já são estáveis; falta mapear validação, conflito e infraestrutura em HTTP e SQS | testes de mapeamento estável em HTTP e SQS |
+| Taxonomia de erros do consumer | workers agirem sem analisar texto | reutilizar as categorias de D-028 sem transportar conceitos de status HTTP para SQS | testes de ack, retry e DLQ por categoria estável |
 | Autenticação | ponto de extensão sem competir com garantias financeiras | IdP externo ou adiamento documentado com porta/guard explícito | integração do IdP ou teste do ponto de extensão; health permanece público |
 | Shutdown de workers | não perder trabalho em andamento | drenagem, extensão/devolução de visibility timeout e ordem de encerramento | `SIGTERM` durante consumo e publicação |
 | Observabilidade | diagnosticar rejeições, retries, DLQ e divergências | formato de logs, correlação e métricas ainda não definidos | testes que confirmem sinais úteis sem expor dados sensíveis |
@@ -404,10 +415,10 @@ O ciclo `up → inspeção → down → inspeção → up` agora é automatizado
 
 ## 10. Limitações atuais
 
-- criação, consultas e reconciliação de wallet e ledger possuem casos de uso; wagering possui uma entrada unificada validada, mas o processador financeiro ainda não foi implementado nem ligado ao bootstrap;
-- não existem endpoints de wallet, wagering ou ledger;
-- não existem consumer, inbox, outbox ou publisher;
-- não existem garantias implementadas de concorrência ou idempotência;
+- endpoints de wallet, ledger, reconciliação e wagering estão implementados com contratos estritos e taxonomia HTTP estável;
+- não existem consumer SQS, publisher da outbox ou workers de referência pendente;
+- inbox e outbox possuem domínio e persistência, mas ainda não possuem os mecanismos operacionais da mensageria;
+- concorrência por wallet e idempotência HTTP estão implementadas; a deduplicação atômica do consumer ainda não;
 - não existem testes automatizados de integração com SQS, concorrência ou crash recovery;
 - não existem autenticação, logs estruturados ou métricas de negócio;
 - o comportamento do emulador local não substitui validação operacional em AWS real.
