@@ -9,8 +9,14 @@ import {
   Post,
   Res,
   UseGuards,
+  Inject,
 } from '@nestjs/common';
 
+import {
+  OPERATIONAL_LOGGER,
+  NOOP_OPERATIONAL_LOGGER,
+  type OperationalLogger,
+} from '../../application/ports/operational-logger.js';
 import {
   GetProviderWagerTransactionUseCase,
   GetWagerTransactionByIdUseCase,
@@ -36,6 +42,8 @@ export class WageringController {
   constructor(
     private readonly processWagerTransaction: ProcessWagerTransactionUseCase,
     private readonly getWagerTransactionById: GetWagerTransactionByIdUseCase,
+    @Inject(OPERATIONAL_LOGGER)
+    private readonly logger: OperationalLogger = NOOP_OPERATIONAL_LOGGER,
   ) {}
 
   @Post()
@@ -46,17 +54,36 @@ export class WageringController {
     @Headers('x-correlation-id') correlationIdHeader: unknown,
     @Res({ passthrough: true }) response: HttpStatusResponse,
   ) {
+    const startedAt = performance.now();
     const command = parseHttpContract(processWagerBodySchema, body);
     const idempotencyKey = parseHttpContract(
       idempotencyKeyHeaderSchema,
       idempotencyKeyHeader,
     );
 
+    const correlationId = resolveCorrelationId(correlationIdHeader);
     const result = await this.processWagerTransaction.execute({
       ...command,
       idempotencyKey,
-      correlationId: resolveCorrelationId(correlationIdHeader),
+      correlationId,
     });
+
+    this.logger.info(
+      result.idempotentReplay ? 'wager.replayed' : 'wager.completed',
+      {
+        correlationId,
+        transactionId: result.transactionId,
+        walletId: command.walletId,
+        providerId: command.providerId,
+        operation: command.kind,
+        status: result.status,
+        ...(result.failureCode === undefined
+          ? {}
+          : { failureCode: result.failureCode }),
+        idempotentReplay: result.idempotentReplay,
+        durationMs: elapsedMilliseconds(startedAt),
+      },
+    );
 
     return respondWithWagerResult(response, result);
   }
@@ -70,6 +97,10 @@ export class WageringController {
 
     return this.getWagerTransactionById.execute(transactionId);
   }
+}
+
+function elapsedMilliseconds(startedAt: number): number {
+  return Math.round((performance.now() - startedAt) * 100) / 100;
 }
 
 @Controller('providers/:providerId/wagering/transactions')

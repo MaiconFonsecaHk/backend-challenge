@@ -9,8 +9,14 @@ import {
   Post,
   Query,
   UseGuards,
+  Inject,
 } from '@nestjs/common';
 
+import {
+  OPERATIONAL_LOGGER,
+  NOOP_OPERATIONAL_LOGGER,
+  type OperationalLogger,
+} from '../../application/ports/operational-logger.js';
 import { CreateWalletUseCase } from '../../application/use-cases/wallet/create-wallet.use-case.js';
 import { GetWalletLedgerUseCase } from '../../application/use-cases/wallet/get-wallet-ledger.use-case.js';
 import { GetWalletUseCase } from '../../application/use-cases/wallet/get-wallet.use-case.js';
@@ -32,19 +38,31 @@ export class WalletController {
     private readonly getWallet: GetWalletUseCase,
     private readonly getWalletLedger: GetWalletLedgerUseCase,
     private readonly reconcileWallet: ReconcileWalletUseCase,
+    @Inject(OPERATIONAL_LOGGER)
+    private readonly logger: OperationalLogger = NOOP_OPERATIONAL_LOGGER,
   ) {}
 
   @Post()
-  create(
+  async create(
     @Body() body: unknown,
     @Headers('x-correlation-id') correlationIdHeader: unknown,
   ) {
+    const startedAt = performance.now();
     const command = parseHttpContract(createWalletBodySchema, body);
-
-    return this.createWallet.execute({
+    const correlationId = resolveCorrelationId(correlationIdHeader);
+    const result = await this.createWallet.execute({
       ...command,
-      correlationId: resolveCorrelationId(correlationIdHeader),
+      correlationId,
     });
+
+    this.logger.info('wallet.created', {
+      correlationId,
+      walletId: result.id,
+      operation: 'OPENING',
+      status: 'PROCESSED',
+      durationMs: elapsedMilliseconds(startedAt),
+    });
+    return result;
   }
 
   @Get(':walletId/ledger')
@@ -64,9 +82,31 @@ export class WalletController {
 
   @Post(':walletId/reconciliation')
   @HttpCode(HttpStatus.OK)
-  reconcile(@Param() params: unknown) {
+  async reconcile(
+    @Param() params: unknown,
+    @Headers('x-correlation-id') correlationIdHeader: unknown,
+  ) {
+    const startedAt = performance.now();
     const { walletId } = parseHttpContract(walletIdParamsSchema, params);
+    const correlationId = resolveCorrelationId(correlationIdHeader);
+    const result = await this.reconcileWallet.execute(walletId);
 
-    return this.reconcileWallet.execute(walletId);
+    const context = {
+      correlationId,
+      walletId,
+      operation: 'RECONCILIATION',
+      status: result.consistent ? 'CONSISTENT' : 'DIVERGENT',
+      durationMs: elapsedMilliseconds(startedAt),
+    } as const;
+    if (result.consistent) {
+      this.logger.info('wallet.reconciled', context);
+    } else {
+      this.logger.warn('wallet.reconciliation.diverged', context);
+    }
+    return result;
   }
+}
+
+function elapsedMilliseconds(startedAt: number): number {
+  return Math.round((performance.now() - startedAt) * 100) / 100;
 }

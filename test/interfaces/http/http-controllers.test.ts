@@ -1,5 +1,9 @@
 import { describe, expect, mock, test } from 'bun:test';
 import { HttpStatus } from '@nestjs/common';
+import type {
+  OperationalLogContext,
+  OperationalLogger,
+} from '../../../src/application/ports/operational-logger.js';
 import type { CreateWalletUseCase } from '../../../src/application/use-cases/wallet/create-wallet.use-case.js';
 import type { GetWalletLedgerUseCase } from '../../../src/application/use-cases/wallet/get-wallet-ledger.use-case.js';
 import type { GetWalletUseCase } from '../../../src/application/use-cases/wallet/get-wallet.use-case.js';
@@ -22,13 +26,17 @@ const TRANSACTION_ID = '30000000-0000-4000-8000-000000000602';
 
 describe('HTTP controllers', () => {
   test('delegates wallet creation with validated transport metadata', async () => {
+    const info = mock(
+      (_event: string, _context: OperationalLogContext) => undefined,
+    );
+    const logger = operationalLogger({ info });
     const execute = mock(async () => ({
       id: WALLET_ID,
       playerId: PLAYER_ID,
       balance: { amount: '10.00', currency: 'BRL' },
       version: 1,
     }));
-    const controller = walletController({ createWalletExecute: execute });
+    const controller = walletController({ createWalletExecute: execute, logger });
 
     await controller.create(
       {
@@ -43,12 +51,30 @@ describe('HTTP controllers', () => {
       initialBalance: { amount: '10.00', currency: 'BRL' },
       correlationId: 'correlation-1',
     });
+    expect(info).toHaveBeenCalledWith(
+      'wallet.created',
+      expect.objectContaining({
+        correlationId: 'correlation-1',
+        walletId: WALLET_ID,
+        operation: 'OPENING',
+        status: 'PROCESSED',
+      }),
+    );
+    const loggedContext = info.mock.calls[0]?.[1];
+    expect(JSON.stringify(loggedContext)).not.toContain('10.00');
   });
 
   test('delegates wallet queries with validated path and pagination', async () => {
     const getExecute = mock(async () => ({ id: WALLET_ID }));
     const ledgerExecute = mock(async () => ({ items: [] }));
-    const reconcileExecute = mock(async () => ({ walletId: WALLET_ID }));
+    const reconcileExecute = mock(async () => ({
+      walletId: WALLET_ID,
+      storedBalance: { amount: '10.00', currency: 'BRL' },
+      calculatedBalance: { amount: '10.00', currency: 'BRL' },
+      difference: { amount: '0.00', currency: 'BRL' },
+      consistent: true,
+      checkedEntries: 1,
+    }));
     const controller = walletController({
       getWalletExecute: getExecute,
       getLedgerExecute: ledgerExecute,
@@ -57,7 +83,7 @@ describe('HTTP controllers', () => {
 
     await controller.get({ walletId: WALLET_ID });
     await controller.ledger({ walletId: WALLET_ID }, { limit: '50' });
-    await controller.reconcile({ walletId: WALLET_ID });
+    await controller.reconcile({ walletId: WALLET_ID }, 'correlation-reconcile');
 
     expect(getExecute).toHaveBeenCalledWith(WALLET_ID);
     expect(ledgerExecute).toHaveBeenCalledWith({ walletId: WALLET_ID, limit: 50 });
@@ -65,12 +91,15 @@ describe('HTTP controllers', () => {
   });
 
   test('uses the Idempotency-Key header as the only transport source', async () => {
+    const info = mock(
+      (_event: string, _context: OperationalLogContext) => undefined,
+    );
     const execute = mock(async () => ({
       transactionId: TRANSACTION_ID,
       status: 'PROCESSED',
       idempotentReplay: false,
     }));
-    const controller = wageringController(execute);
+    const controller = wageringController(execute, undefined, operationalLogger({ info }));
     const setStatus = mock(() => undefined);
 
     await controller.process(
@@ -102,6 +131,23 @@ describe('HTTP controllers', () => {
       correlationId: 'correlation-2',
     });
     expect(setStatus).toHaveBeenCalledWith(HttpStatus.OK);
+    expect(info).toHaveBeenCalledWith(
+      'wager.completed',
+      expect.objectContaining({
+        correlationId: 'correlation-2',
+        transactionId: TRANSACTION_ID,
+        walletId: WALLET_ID,
+        providerId: 'provider-a',
+        operation: WagerTransactionKind.Bet,
+        status: 'PROCESSED',
+        idempotentReplay: false,
+      }),
+    );
+    const loggedContext = info.mock.calls[0]?.[1];
+    expect(JSON.stringify(loggedContext)).not.toContain('25.00');
+    expect(JSON.stringify(loggedContext)).not.toContain(
+      'provider-a:transaction-123',
+    );
   });
 
   test('delegates both transaction lookup routes', async () => {
@@ -133,21 +179,33 @@ function walletController(options: {
   readonly getWalletExecute?: ReturnType<typeof mock>;
   readonly getLedgerExecute?: ReturnType<typeof mock>;
   readonly reconcileExecute?: ReturnType<typeof mock>;
+  readonly logger?: OperationalLogger;
 }): WalletController {
   return new WalletController(
     { execute: options.createWalletExecute ?? mock(async () => undefined) } as unknown as CreateWalletUseCase,
     { execute: options.getWalletExecute ?? mock(async () => undefined) } as unknown as GetWalletUseCase,
     { execute: options.getLedgerExecute ?? mock(async () => undefined) } as unknown as GetWalletLedgerUseCase,
     { execute: options.reconcileExecute ?? mock(async () => undefined) } as unknown as ReconcileWalletUseCase,
+    options.logger,
   );
 }
 
 function wageringController(
   processExecute: ReturnType<typeof mock>,
   getExecute: ReturnType<typeof mock> = mock(async () => undefined),
+  logger?: OperationalLogger,
 ): WageringController {
   return new WageringController(
     { execute: processExecute } as unknown as ProcessWagerTransactionUseCase,
     { execute: getExecute } as unknown as GetWagerTransactionByIdUseCase,
+    logger,
   );
+}
+
+function operationalLogger(overrides: Partial<OperationalLogger> = {}): OperationalLogger {
+  return {
+    info: overrides.info ?? (() => undefined),
+    warn: overrides.warn ?? (() => undefined),
+    error: overrides.error ?? (() => undefined),
+  };
 }

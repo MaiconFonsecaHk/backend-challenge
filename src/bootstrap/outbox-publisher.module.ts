@@ -4,6 +4,10 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
 import type { Clock } from '../application/ports/clock.js';
 import { CLOCK } from '../application/ports/clock.js';
 import {
+  OPERATIONAL_LOGGER,
+  type OperationalLogger,
+} from '../application/ports/operational-logger.js';
+import {
   OUTBOX_EVENT_TRANSPORT,
   type OutboxEventTransport,
 } from '../application/ports/outbox-event-transport.js';
@@ -42,18 +46,21 @@ import { OutboxPublisherWorker } from '../interfaces/workers/outbox-publisher.wo
         OUTBOX_EVENT_TRANSPORT,
         CLOCK,
         ExponentialOutboxRetryPolicy,
+        OPERATIONAL_LOGGER,
       ],
       useFactory: (
         unitOfWork: UnitOfWork,
         transport: OutboxEventTransport,
         clock: Clock,
         retryPolicy: ExponentialOutboxRetryPolicy,
+        logger: OperationalLogger,
       ) =>
         new PublishOutboxBatchUseCase(
           unitOfWork,
           transport,
           clock,
           retryPolicy,
+          logger,
         ),
     },
     OutboxPublisherWorker,

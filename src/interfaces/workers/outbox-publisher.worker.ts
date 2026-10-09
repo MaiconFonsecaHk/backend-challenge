@@ -1,10 +1,16 @@
 import {
+  Inject,
   Injectable,
   type OnApplicationBootstrap,
   type OnApplicationShutdown,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 
+import {
+  OPERATIONAL_LOGGER,
+  NOOP_OPERATIONAL_LOGGER,
+  type OperationalLogger,
+} from '../../application/ports/operational-logger.js';
 import { PublishOutboxBatchUseCase } from '../../application/use-cases/messaging/publish-outbox-batch.use-case.js';
 import type { EnvironmentVariables } from '../../config/environment.schema.js';
 
@@ -19,6 +25,8 @@ export class OutboxPublisherWorker
   constructor(
     private readonly publishBatch: PublishOutboxBatchUseCase,
     private readonly config: ConfigService<EnvironmentVariables, true>,
+    @Inject(OPERATIONAL_LOGGER)
+    private readonly logger: OperationalLogger = NOOP_OPERATIONAL_LOGGER,
   ) {}
 
   onApplicationBootstrap(): void {
@@ -35,11 +43,28 @@ export class OutboxPublisherWorker
   private async run(): Promise<void> {
     while (this.running) {
       try {
-        await this.publishBatch.execute(
+        const result = await this.publishBatch.execute(
           this.config.get('OUTBOX_BATCH_SIZE', { infer: true }),
         );
-      } catch {
-        // The transaction remains authoritative; the next poll retries due work.
+        if (result.claimed > 0) {
+          const context = {
+            operation: 'OUTBOX_PUBLICATION',
+            claimed: result.claimed,
+            published: result.published,
+            failed: result.failed,
+          } as const;
+          if (result.failed > 0) {
+            this.logger.warn('outbox.batch.completed_with_retries', context);
+          } else {
+            this.logger.info('outbox.batch.completed', context);
+          }
+        }
+      } catch (error) {
+        this.logger.error('outbox.batch.failed', {
+          operation: 'OUTBOX_PUBLICATION',
+          errorType: errorType(error),
+          retryable: true,
+        });
       }
 
       if (this.running) {
@@ -65,4 +90,8 @@ export class OutboxPublisherWorker
       this.wakeDelay = complete;
     });
   }
+}
+
+function errorType(error: unknown): string {
+  return error instanceof Error ? error.constructor.name : 'UnknownError';
 }

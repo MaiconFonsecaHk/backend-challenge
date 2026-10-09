@@ -1,6 +1,7 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, mock, test } from 'bun:test';
 
 import type { Clock } from '../../../src/application/ports/clock.js';
+import type { OperationalLogger } from '../../../src/application/ports/operational-logger.js';
 import type {
   PersistenceRepositories,
   WagerTransactionRecord,
@@ -66,6 +67,8 @@ function record(
 
 describe('ProcessPendingReferencesBatchUseCase', () => {
   test('claims one transaction per unit of work and counts every terminal outcome', async () => {
+    const info = mock(() => undefined);
+    const warn = mock(() => undefined);
     const claimed = [
       record('30000000-0000-4000-8000-000000000811', WagerTransactionStatus.PendingReference),
       record('30000000-0000-4000-8000-000000000812', WagerTransactionStatus.PendingReference),
@@ -116,6 +119,7 @@ describe('ProcessPendingReferencesBatchUseCase', () => {
       unitOfWork,
       executor,
       new FixedClock(),
+      operationalLogger({ info, warn }),
     );
 
     expect(await useCase.execute(10)).toEqual({
@@ -128,6 +132,32 @@ describe('ProcessPendingReferencesBatchUseCase', () => {
     expect(saved).toHaveLength(3);
     expect(lockedWalletIds).toEqual([WALLET_ID, WALLET_ID, WALLET_ID]);
     expect(claimTimes.every((time) => time.getTime() === NOW.getTime())).toBeTrue();
+    expect(info).toHaveBeenCalledWith(
+      'pending_reference.processed',
+      expect.objectContaining({
+        transactionId: '30000000-0000-4000-8000-000000000811',
+        walletId: WALLET_ID,
+        operation: WagerTransactionKind.Refund,
+        status: WagerTransactionStatus.Processed,
+      }),
+    );
+    expect(warn).toHaveBeenCalledWith(
+      'pending_reference.rejected',
+      expect.objectContaining({
+        transactionId: '30000000-0000-4000-8000-000000000812',
+        failureCode: 'REFERENCE_NOT_FOUND',
+      }),
+    );
+    expect(warn).toHaveBeenCalledWith(
+      'pending_reference.retry_scheduled',
+      expect.objectContaining({
+        transactionId: '30000000-0000-4000-8000-000000000813',
+        retryable: true,
+      }),
+    );
+    expect(JSON.stringify([...info.mock.calls, ...warn.mock.calls])).not.toContain(
+      '10.00',
+    );
   });
 
   test('rejects an invalid limit before opening the unit of work', async () => {
@@ -150,3 +180,11 @@ describe('ProcessPendingReferencesBatchUseCase', () => {
     expect(opened).toBeFalse();
   });
 });
+
+function operationalLogger(overrides: Partial<OperationalLogger> = {}): OperationalLogger {
+  return {
+    info: overrides.info ?? (() => undefined),
+    warn: overrides.warn ?? (() => undefined),
+    error: overrides.error ?? (() => undefined),
+  };
+}

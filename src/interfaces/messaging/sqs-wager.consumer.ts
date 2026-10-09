@@ -18,6 +18,11 @@ import {
 import { ConfigService } from '@nestjs/config';
 
 import type { EnvironmentVariables } from '../../config/environment.schema.js';
+import {
+  OPERATIONAL_LOGGER,
+  NOOP_OPERATIONAL_LOGGER,
+  type OperationalLogger,
+} from '../../application/ports/operational-logger.js';
 import { SQS_CLIENT } from '../../infrastructure/messaging/sqs.constants.js';
 import {
   isTransientWagerMessageError,
@@ -43,6 +48,8 @@ export class SqsWagerConsumer
     @Inject(SQS_CLIENT) private readonly client: SQSClient,
     private readonly config: ConfigService<EnvironmentVariables, true>,
     private readonly handler: SqsWagerMessageHandler,
+    @Inject(OPERATIONAL_LOGGER)
+    private readonly logger: OperationalLogger = NOOP_OPERATIONAL_LOGGER,
   ) {}
 
   async onApplicationBootstrap(): Promise<void> {
@@ -78,12 +85,17 @@ export class SqsWagerConsumer
         );
         this.receiveAbortController = undefined;
         await this.processBatch(response.Messages ?? []);
-      } catch {
+      } catch (error) {
         this.receiveAbortController = undefined;
         if (!this.running) {
           return;
         }
 
+        this.logger.error('sqs.poll.failed', {
+          operation: 'RECEIVE',
+          errorType: errorType(error),
+          retryable: true,
+        });
         await delay(POLL_FAILURE_DELAY_MS);
       }
     }
@@ -143,6 +155,17 @@ export class SqsWagerConsumer
       infer: true,
     });
     if (receiveCount >= maximumReceives) {
+      this.logger.warn('sqs.wager.retry.exhausted', {
+        ...(message.MessageId === undefined
+          ? {}
+          : { messageId: message.MessageId }),
+        ...(message.Attributes?.MessageGroupId === undefined
+          ? {}
+          : { walletId: message.Attributes.MessageGroupId }),
+        operation: 'WAGER_CONSUMPTION',
+        status: 'AWAITING_REDRIVE',
+        attempt: receiveCount,
+      });
       return;
     }
 
@@ -157,6 +180,18 @@ export class SqsWagerConsumer
         ),
       }),
     );
+    this.logger.warn('sqs.wager.retry.scheduled', {
+      ...(message.MessageId === undefined
+        ? {}
+        : { messageId: message.MessageId }),
+      ...(message.Attributes?.MessageGroupId === undefined
+        ? {}
+        : { walletId: message.Attributes.MessageGroupId }),
+      operation: 'WAGER_CONSUMPTION',
+      status: 'RETRY_SCHEDULED',
+      attempt: receiveCount,
+      retryable: true,
+    });
   }
 
   private async moveToDeadLetterQueue(message: Message): Promise<void> {
@@ -173,6 +208,18 @@ export class SqsWagerConsumer
         MessageDeduplicationId: messageIdentity,
       }),
     );
+    this.logger.error('sqs.wager.moved_to_dlq', {
+      ...(message.MessageId === undefined
+        ? {}
+        : { messageId: message.MessageId }),
+      ...(message.Attributes?.MessageGroupId === undefined
+        ? {}
+        : { walletId: message.Attributes.MessageGroupId }),
+      operation: 'WAGER_CONSUMPTION',
+      status: 'DLQ',
+      attempt: parseReceiveCount(message.Attributes?.ApproximateReceiveCount),
+      retryable: false,
+    });
   }
 
   private deleteMessage(receiptHandle: string): Promise<unknown> {
@@ -225,4 +272,8 @@ function parseReceiveCount(value: string | undefined): number {
 
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function errorType(error: unknown): string {
+  return error instanceof Error ? error.constructor.name : 'UnknownError';
 }

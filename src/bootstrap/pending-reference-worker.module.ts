@@ -3,6 +3,10 @@ import { ConfigModule } from '@nestjs/config';
 
 import type { Clock } from '../application/ports/clock.js';
 import { CLOCK } from '../application/ports/clock.js';
+import {
+  OPERATIONAL_LOGGER,
+  type OperationalLogger,
+} from '../application/ports/operational-logger.js';
 import type { UnitOfWork } from '../application/ports/persistence/unit-of-work.js';
 import { PERSISTENCE_UNIT_OF_WORK } from '../application/ports/persistence/unit-of-work.js';
 import { WagerTransactionExecutor } from '../application/services/wager-transaction.executor.js';
@@ -19,16 +23,23 @@ import { WageringApplicationModule } from './wagering-application.module.js';
     { provide: CLOCK, useClass: SystemClock },
     {
       provide: ProcessPendingReferencesBatchUseCase,
-      inject: [PERSISTENCE_UNIT_OF_WORK, WagerTransactionExecutor, CLOCK],
+      inject: [
+        PERSISTENCE_UNIT_OF_WORK,
+        WagerTransactionExecutor,
+        CLOCK,
+        OPERATIONAL_LOGGER,
+      ],
       useFactory: (
         unitOfWork: UnitOfWork,
         executor: WagerTransactionExecutor,
         clock: Clock,
+        logger: OperationalLogger,
       ) =>
         new ProcessPendingReferencesBatchUseCase(
           unitOfWork,
           executor,
           clock,
+          logger,
         ),
     },
     PendingReferenceWorker,

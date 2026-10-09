@@ -1,4 +1,8 @@
 import type { Clock } from '../../ports/clock.js';
+import {
+  NOOP_OPERATIONAL_LOGGER,
+  type OperationalLogger,
+} from '../../ports/operational-logger.js';
 import type { UnitOfWork } from '../../ports/persistence/unit-of-work.js';
 import { WagerTransactionExecutor } from '../../services/wager-transaction.executor.js';
 import { WagerTransactionStatus } from '../../../domain/wagering/wager-transaction.js';
@@ -15,6 +19,7 @@ export class ProcessPendingReferencesBatchUseCase {
     private readonly unitOfWork: UnitOfWork,
     private readonly executor: WagerTransactionExecutor,
     private readonly clock: Clock,
+    private readonly logger: OperationalLogger = NOOP_OPERATIONAL_LOGGER,
   ) {}
 
   async execute(limit: number): Promise<ProcessPendingReferencesBatchResult> {
@@ -54,7 +59,7 @@ export class ProcessPendingReferencesBatchUseCase {
           repositories,
         );
         await repositories.wagerTransactions.save(updated);
-        return updated.transaction.status;
+        return updated;
       });
 
       if (outcome === undefined) {
@@ -62,14 +67,37 @@ export class ProcessPendingReferencesBatchUseCase {
       }
 
       claimed += 1;
-      if (outcome === WagerTransactionStatus.Processed) {
+      const { transaction } = outcome;
+      const context = {
+        correlationId: transaction.id,
+        transactionId: transaction.id,
+        walletId: transaction.walletId,
+        providerId: transaction.providerId,
+        operation: transaction.kind,
+        status: transaction.status,
+        ...(transaction.failureCode === undefined
+          ? {}
+          : { failureCode: transaction.failureCode }),
+        attempt: outcome.referenceAttempts,
+      };
+      if (transaction.status === WagerTransactionStatus.Processed) {
         processed += 1;
-      } else if (outcome === WagerTransactionStatus.Rejected) {
+        this.logger.info('pending_reference.processed', context);
+      } else if (transaction.status === WagerTransactionStatus.Rejected) {
         rejected += 1;
-      } else if (outcome === WagerTransactionStatus.PendingReference) {
+        this.logger.warn('pending_reference.rejected', context);
+      } else if (
+        transaction.status === WagerTransactionStatus.PendingReference
+      ) {
         rescheduled += 1;
+        this.logger.warn('pending_reference.retry_scheduled', {
+          ...context,
+          retryable: true,
+        });
       } else {
-        throw new Error(`Unexpected pending-reference outcome: ${outcome}`);
+        throw new Error(
+          `Unexpected pending-reference outcome: ${transaction.status}`,
+        );
       }
     }
 

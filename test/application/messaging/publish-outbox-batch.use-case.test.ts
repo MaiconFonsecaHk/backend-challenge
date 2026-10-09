@@ -1,6 +1,7 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, mock, test } from 'bun:test';
 
 import type { Clock } from '../../../src/application/ports/clock.js';
+import type { OperationalLogger } from '../../../src/application/ports/operational-logger.js';
 import type {
   OutboxEventPublication,
   OutboxEventTransport,
@@ -35,7 +36,12 @@ describe('PublishOutboxBatchUseCase', () => {
   test('schedules a bounded retry without preventing later events in the batch', async () => {
     const failed = message('50000000-0000-4000-8000-000000000703');
     const published = message('50000000-0000-4000-8000-000000000704');
-    const harness = createHarness([failed, published], failed.id);
+    const warn = mock(() => undefined);
+    const harness = createHarness(
+      [failed, published],
+      failed.id,
+      operationalLogger({ warn }),
+    );
 
     const result = await harness.useCase.execute(2);
 
@@ -47,6 +53,14 @@ describe('PublishOutboxBatchUseCase', () => {
     expect(failed.publishedAt).toBeUndefined();
     expect(published.publishedAt).toEqual(NOW);
     expect(harness.saved).toEqual([failed, published]);
+    expect(warn).toHaveBeenCalledWith('outbox.publish.retry_scheduled', {
+      eventId: failed.id,
+      eventType: 'WalletBalanceChanged',
+      operation: 'OUTBOX_PUBLICATION',
+      status: 'RETRY_SCHEDULED',
+      attempt: 1,
+      retryable: true,
+    });
   });
 
   test('does no transport or persistence work when no event is due', async () => {
@@ -93,6 +107,7 @@ function message(id: string): OutboxMessage {
 function createHarness(
   messages: readonly OutboxMessage[],
   failingId?: string,
+  logger?: OperationalLogger,
 ): {
   readonly useCase: PublishOutboxBatchUseCase;
   readonly queries: Array<{ now: Date; limit: number }>;
@@ -137,10 +152,19 @@ function createHarness(
       transport,
       clock,
       new ExponentialOutboxRetryPolicy(5, 300),
+      logger,
     ),
     queries,
     publications,
     saved,
     unitOfWorkCalls: () => calls,
+  };
+}
+
+function operationalLogger(overrides: Partial<OperationalLogger> = {}): OperationalLogger {
+  return {
+    info: overrides.info ?? (() => undefined),
+    warn: overrides.warn ?? (() => undefined),
+    error: overrides.error ?? (() => undefined),
   };
 }

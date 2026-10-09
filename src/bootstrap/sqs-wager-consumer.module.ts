@@ -3,6 +3,10 @@ import { ConfigModule } from '@nestjs/config';
 
 import type { Clock } from '../application/ports/clock.js';
 import type { PayloadDigest } from '../application/ports/payload-digest.js';
+import {
+  OPERATIONAL_LOGGER,
+  type OperationalLogger,
+} from '../application/ports/operational-logger.js';
 import { ProcessWagerTransactionUseCase } from '../application/use-cases/wagering/process-wager-transaction.use-case.js';
 import { Sha256PayloadDigest } from '../infrastructure/cryptography/sha256-payload-digest.js';
 import { SqsModule } from '../infrastructure/messaging/sqs.module.js';
@@ -22,12 +26,14 @@ import { WageringApplicationModule } from './wagering-application.module.js';
         ProcessWagerTransactionUseCase,
         Sha256PayloadDigest,
         SystemClock,
+        OPERATIONAL_LOGGER,
       ],
       useFactory: (
         useCase: ProcessWagerTransactionUseCase,
         digest: PayloadDigest,
         clock: Clock,
-      ) => new SqsWagerMessageHandler(useCase, digest, clock),
+        logger: OperationalLogger,
+      ) => new SqsWagerMessageHandler(useCase, digest, clock, logger),
     },
     SqsWagerConsumer,
   ],

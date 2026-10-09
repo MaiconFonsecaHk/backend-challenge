@@ -8,6 +8,7 @@ import { HttpApiModule } from './http-api.module.js';
 import { SqsWagerConsumerModule } from './sqs-wager-consumer.module.js';
 import { OutboxPublisherModule } from './outbox-publisher.module.js';
 import { PendingReferenceWorkerModule } from './pending-reference-worker.module.js';
+import { ObservabilityModule } from './observability.module.js';
 
 @Module({
   imports: [
@@ -18,6 +19,7 @@ import { PendingReferenceWorkerModule } from './pending-reference-worker.module.
       validationSchema: environmentSchema,
     }),
     PersistenceModule,
+    ObservabilityModule,
     HttpApiModule,
     SqsWagerConsumerModule,
     OutboxPublisherModule,

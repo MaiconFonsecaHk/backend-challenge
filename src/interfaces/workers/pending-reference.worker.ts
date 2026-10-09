@@ -1,10 +1,16 @@
 import {
+  Inject,
   Injectable,
   type OnApplicationBootstrap,
   type OnApplicationShutdown,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 
+import {
+  OPERATIONAL_LOGGER,
+  NOOP_OPERATIONAL_LOGGER,
+  type OperationalLogger,
+} from '../../application/ports/operational-logger.js';
 import { ProcessPendingReferencesBatchUseCase } from '../../application/use-cases/wagering/process-pending-references-batch.use-case.js';
 import type { EnvironmentVariables } from '../../config/environment.schema.js';
 
@@ -19,6 +25,8 @@ export class PendingReferenceWorker
   constructor(
     private readonly processBatch: ProcessPendingReferencesBatchUseCase,
     private readonly config: ConfigService<EnvironmentVariables, true>,
+    @Inject(OPERATIONAL_LOGGER)
+    private readonly logger: OperationalLogger = NOOP_OPERATIONAL_LOGGER,
   ) {}
 
   onApplicationBootstrap(): void {
@@ -35,11 +43,32 @@ export class PendingReferenceWorker
   private async run(): Promise<void> {
     while (this.running) {
       try {
-        await this.processBatch.execute(
+        const result = await this.processBatch.execute(
           this.config.get('PENDING_REFERENCE_BATCH_SIZE', { infer: true }),
         );
-      } catch {
-        // Rolled-back work remains due and can be claimed by the next poll.
+        if (result.claimed > 0) {
+          const context = {
+            operation: 'PENDING_REFERENCE_RECOVERY',
+            claimed: result.claimed,
+            processed: result.processed,
+            rejected: result.rejected,
+            rescheduled: result.rescheduled,
+          } as const;
+          if (result.rejected > 0 || result.rescheduled > 0) {
+            this.logger.warn(
+              'pending_reference.batch.completed_with_pending_work',
+              context,
+            );
+          } else {
+            this.logger.info('pending_reference.batch.completed', context);
+          }
+        }
+      } catch (error) {
+        this.logger.error('pending_reference.batch.failed', {
+          operation: 'PENDING_REFERENCE_RECOVERY',
+          errorType: errorType(error),
+          retryable: true,
+        });
       }
 
       if (this.running) {
@@ -65,4 +94,8 @@ export class PendingReferenceWorker
       this.wakeDelay = complete;
     });
   }
+}
+
+function errorType(error: unknown): string {
+  return error instanceof Error ? error.constructor.name : 'UnknownError';
 }

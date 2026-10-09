@@ -8,6 +8,7 @@ import {
 } from '@aws-sdk/client-sqs';
 import type { ConfigService } from '@nestjs/config';
 
+import type { OperationalLogger } from '../../../src/application/ports/operational-logger.js';
 import type { EnvironmentVariables } from '../../../src/config/environment.schema.js';
 import { SqsWagerConsumer } from '../../../src/interfaces/messaging/sqs-wager.consumer.js';
 import { InvalidSqsWagerMessageError } from '../../../src/interfaces/messaging/sqs-wager-message.error.js';
@@ -62,12 +63,17 @@ describe('SQS wager consumer', () => {
 
   test('backs off a transient failure without acknowledging the message', async () => {
     const commands: unknown[] = [];
+    const warn = mock(() => undefined);
     const transient = Object.assign(new Error('temporary timeout'), {
       code: 'ETIMEDOUT',
     });
-    const consumer = consumerHarness(commands, async () => {
-      throw transient;
-    });
+    const consumer = consumerHarness(
+      commands,
+      async () => {
+        throw transient;
+      },
+      operationalLogger({ warn }),
+    );
 
     await processBatch(consumer, [
       message('message-2', 'wallet-a', '{}', '2'),
@@ -79,6 +85,14 @@ describe('SQS wager consumer', () => {
       QueueUrl: QUEUE_URL,
       ReceiptHandle: 'receipt-message-2',
       VisibilityTimeout: 60,
+    });
+    expect(warn).toHaveBeenCalledWith('sqs.wager.retry.scheduled', {
+      messageId: 'message-2',
+      walletId: 'wallet-a',
+      operation: 'WAGER_CONSUMPTION',
+      status: 'RETRY_SCHEDULED',
+      attempt: 2,
+      retryable: true,
     });
   });
 
@@ -97,9 +111,14 @@ describe('SQS wager consumer', () => {
 
   test('moves a permanent failure to the DLQ before deleting the source', async () => {
     const commands: unknown[] = [];
-    const consumer = consumerHarness(commands, async () => {
-      throw new InvalidSqsWagerMessageError();
-    });
+    const error = mock(() => undefined);
+    const consumer = consumerHarness(
+      commands,
+      async () => {
+        throw new InvalidSqsWagerMessageError();
+      },
+      operationalLogger({ error }),
+    );
 
     await processBatch(consumer, [message('message-4', 'wallet-a')]);
 
@@ -112,6 +131,14 @@ describe('SQS wager consumer', () => {
       MessageDeduplicationId: 'message-4',
     });
     expect(commands[1]).toBeInstanceOf(DeleteMessageCommand);
+    expect(error).toHaveBeenCalledWith('sqs.wager.moved_to_dlq', {
+      messageId: 'message-4',
+      walletId: 'wallet-a',
+      operation: 'WAGER_CONSUMPTION',
+      status: 'DLQ',
+      attempt: 1,
+      retryable: false,
+    });
   });
 
   test('leaves a successfully processed message for redelivery when its ack fails', async () => {
@@ -157,6 +184,7 @@ describe('SQS wager consumer', () => {
 function consumerHarness(
   commands: unknown[],
   handle: (body: string | undefined, group: string | undefined) => Promise<unknown>,
+  logger?: OperationalLogger,
 ): SqsWagerConsumer {
   const client = {
     send: mock(async (command: unknown) => {
@@ -176,6 +204,7 @@ function consumerHarness(
     client,
     config,
     { handle } as unknown as SqsWagerMessageHandler,
+    logger,
   );
   const internals = consumer as unknown as {
     queueUrl: string;
@@ -184,6 +213,14 @@ function consumerHarness(
   internals.queueUrl = QUEUE_URL;
   internals.deadLetterQueueUrl = DLQ_URL;
   return consumer;
+}
+
+function operationalLogger(overrides: Partial<OperationalLogger> = {}): OperationalLogger {
+  return {
+    info: overrides.info ?? (() => undefined),
+    warn: overrides.warn ?? (() => undefined),
+    error: overrides.error ?? (() => undefined),
+  };
 }
 
 function processBatch(

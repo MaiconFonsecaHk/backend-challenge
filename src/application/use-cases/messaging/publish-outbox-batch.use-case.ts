@@ -1,4 +1,9 @@
 import type { Clock } from '../../ports/clock.js';
+import {
+  NOOP_OPERATIONAL_LOGGER,
+  type OperationalLogContext,
+  type OperationalLogger,
+} from '../../ports/operational-logger.js';
 import type {
   OutboxEventPublication,
   OutboxEventTransport,
@@ -18,20 +23,22 @@ export class PublishOutboxBatchUseCase {
     private readonly transport: OutboxEventTransport,
     private readonly clock: Clock,
     private readonly retryPolicy: OutboxRetryPolicy,
+    private readonly logger: OperationalLogger = NOOP_OPERATIONAL_LOGGER,
   ) {}
 
-  execute(limit: number): Promise<PublishOutboxBatchResult> {
+  async execute(limit: number): Promise<PublishOutboxBatchResult> {
     if (!Number.isSafeInteger(limit) || limit < 1) {
       throw new Error('Outbox batch limit must be a positive safe integer.');
     }
 
-    return this.unitOfWork.execute(async (repositories) => {
+    const execution = await this.unitOfWork.execute(async (repositories) => {
       const messages = await repositories.outboxMessages.findDueForUpdate(
         this.clock.now(),
         limit,
       );
       let published = 0;
       let failed = 0;
+      const retries: OperationalLogContext[] = [];
 
       for (const message of messages) {
         try {
@@ -48,16 +55,32 @@ export class PublishOutboxBatchUseCase {
         } catch {
           message.scheduleRetry(this.clock.now(), this.retryPolicy);
           failed += 1;
+          retries.push({
+            eventId: message.id,
+            eventType: message.eventType,
+            operation: 'OUTBOX_PUBLICATION',
+            status: 'RETRY_SCHEDULED',
+            attempt: message.attempts,
+            retryable: true,
+          });
         }
 
         await repositories.outboxMessages.save(message);
       }
 
       return Object.freeze({
-        claimed: messages.length,
-        published,
-        failed,
+        result: Object.freeze({
+          claimed: messages.length,
+          published,
+          failed,
+        }),
+        retries: Object.freeze(retries),
       });
     });
+
+    for (const context of execution.retries) {
+      this.logger.warn('outbox.publish.retry_scheduled', context);
+    }
+    return execution.result;
   }
 }

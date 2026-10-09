@@ -1,6 +1,10 @@
 import { describe, expect, mock, test } from 'bun:test';
 
 import type { Clock } from '../../../src/application/ports/clock.js';
+import type {
+  OperationalLogContext,
+  OperationalLogger,
+} from '../../../src/application/ports/operational-logger.js';
 import type { PayloadDigest } from '../../../src/application/ports/payload-digest.js';
 import type { ProcessWagerTransactionUseCase } from '../../../src/application/use-cases/wagering/process-wager-transaction.use-case.js';
 import { WagerTransactionStatus } from '../../../src/domain/wagering/wager-transaction.js';
@@ -36,6 +40,9 @@ function body(overrides: Record<string, unknown> = {}): string {
 
 describe('SQS wager message boundary', () => {
   test('reuses the HTTP use case with persistent delivery metadata', async () => {
+    const info = mock(
+      (_event: string, _context: OperationalLogContext) => undefined,
+    );
     const execute = mock(async () => ({
       transactionId: '30000000-0000-4000-8000-000000000701',
       status: WagerTransactionStatus.Processed,
@@ -51,6 +58,7 @@ describe('SQS wager message boundary', () => {
         },
       } satisfies PayloadDigest,
       { now: () => new Date(RECEIVED_AT) } satisfies Clock,
+      operationalLogger({ info }),
     );
 
     await handler.handle(body(), WALLET_ID);
@@ -75,6 +83,22 @@ describe('SQS wager message boundary', () => {
     });
     expect(digested[0]).toBe(
       '{"data":{"externalTransactionId":"external-701","gameId":"game-701","idempotencyKey":"provider-a:external-701","kind":"BET","money":{"amount":"25.00","currency":"BRL"},"playerId":"10000000-0000-4000-8000-000000000701","providerId":"provider-a","roundId":"round-701","walletId":"20000000-0000-4000-8000-000000000701"},"messageId":"message-701","occurredAt":"2026-10-08T20:59:59.000Z","type":"WagerTransactionRequested"}',
+    );
+    expect(info).toHaveBeenCalledWith(
+      'sqs.wager.completed',
+      expect.objectContaining({
+        correlationId: 'message-701',
+        messageId: 'message-701',
+        walletId: WALLET_ID,
+        providerId: 'provider-a',
+        operation: 'BET',
+        status: WagerTransactionStatus.Processed,
+      }),
+    );
+    const loggedContext = info.mock.calls[0]?.[1];
+    expect(JSON.stringify(loggedContext)).not.toContain('25.00');
+    expect(JSON.stringify(loggedContext)).not.toContain(
+      'provider-a:external-701',
     );
   });
 
@@ -118,4 +142,12 @@ function handlerWith(execute: ReturnType<typeof mock>): SqsWagerMessageHandler {
     { digest: () => 'hash' } satisfies PayloadDigest,
     { now: () => new Date(RECEIVED_AT) } satisfies Clock,
   );
+}
+
+function operationalLogger(overrides: Partial<OperationalLogger> = {}): OperationalLogger {
+  return {
+    info: overrides.info ?? (() => undefined),
+    warn: overrides.warn ?? (() => undefined),
+    error: overrides.error ?? (() => undefined),
+  };
 }

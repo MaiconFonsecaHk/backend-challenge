@@ -1,7 +1,8 @@
 import { Module } from '@nestjs/common';
-import { APP_FILTER } from '@nestjs/core';
+import { APP_FILTER, APP_INTERCEPTOR } from '@nestjs/core';
 
 import { HttpExceptionFilter } from '../interfaces/http/http-exception.filter.js';
+import { CorrelationIdInterceptor } from '../interfaces/http/correlation-id.interceptor.js';
 import { DeferredProviderAuthenticationGuard } from '../interfaces/http/deferred-provider-auth.guard.js';
 import {
   ProviderWageringController,
@@ -16,6 +17,7 @@ import { WalletApplicationModule } from './wallet-application.module.js';
   controllers: [WalletController, WageringController, ProviderWageringController],
   providers: [
     DeferredProviderAuthenticationGuard,
+    { provide: APP_INTERCEPTOR, useClass: CorrelationIdInterceptor },
     { provide: APP_FILTER, useClass: HttpExceptionFilter },
   ],
 })
