@@ -52,6 +52,12 @@ interface EntityManagerDouble {
   }>;
   readonly persisted: object[];
   readonly assignments: Array<{ entity: object; data: object }>;
+  readonly nativeUpdates: Array<{
+    entityType: new (...args: never[]) => object;
+    where: object;
+    data: object;
+  }>;
+  readonly refreshed: object[];
   readonly executeCalls: Array<{
     query: string;
     params: readonly unknown[];
@@ -68,6 +74,8 @@ function entityManagerDouble(
   const findCalls: EntityManagerDouble['findCalls'] = [];
   const persisted: object[] = [];
   const assignments: EntityManagerDouble['assignments'] = [];
+  const nativeUpdates: EntityManagerDouble['nativeUpdates'] = [];
+  const refreshed: object[] = [];
   const executeCalls: EntityManagerDouble['executeCalls'] = [];
 
   const entityManager = {
@@ -108,6 +116,18 @@ function entityManagerDouble(
       assignments.push({ entity, data });
       return Object.assign(entity, data);
     },
+    async nativeUpdate(
+      entityType: new (...args: never[]) => object,
+      where: object,
+      data: object,
+    ) {
+      nativeUpdates.push({ entityType, where, data });
+      return 1;
+    },
+    async refresh(entity: object) {
+      refreshed.push(entity);
+      return entity;
+    },
   } as unknown as EntityManager;
 
   return {
@@ -116,6 +136,8 @@ function entityManagerDouble(
     findCalls,
     persisted,
     assignments,
+    nativeUpdates,
+    refreshed,
     executeCalls,
   };
 }
@@ -241,12 +263,15 @@ describe('MikroORM repositories', () => {
       new WagerTransactionPersistenceEntity(),
       WagerTransactionPersistenceMapper.toPersistence(pendingRecord),
     );
-    const double = entityManagerDouble(persistenceEntity);
+    const double = entityManagerDouble(persistenceEntity, [], [
+      { id: TRANSACTION_ID },
+    ]);
     const repository = new MikroOrmWagerTransactionRepository(
       double.entityManager,
     );
 
     await repository.findById(TRANSACTION_ID);
+    await repository.findNextPendingReferenceDueForUpdate(UPDATED_AT);
     await repository.findByIdempotencyKey('provider-a:external-1');
     await repository.findByProviderTransaction('provider-a', 'external-1');
     await repository.findByReferenceAndKind(
@@ -259,6 +284,7 @@ describe('MikroORM repositories', () => {
 
     expect(double.findOneCalls.map((call) => call.where)).toEqual([
       { id: TRANSACTION_ID },
+      { id: TRANSACTION_ID },
       { idempotencyKey: 'provider-a:external-1' },
       { providerId: 'provider-a', externalTransactionId: 'external-1' },
       {
@@ -267,10 +293,21 @@ describe('MikroORM repositories', () => {
       },
       { id: TRANSACTION_ID },
     ]);
+    expect(double.executeCalls).toHaveLength(1);
+    expect(double.executeCalls[0]?.query.toLowerCase()).toContain(
+      "status = 'pending_reference'",
+    );
+    expect(double.executeCalls[0]?.query.toLowerCase()).toContain(
+      'for update of candidate skip locked',
+    );
+    expect(double.executeCalls[0]?.params).toEqual([UPDATED_AT]);
     expect(double.persisted[0]).toBeInstanceOf(
       WagerTransactionPersistenceEntity,
     );
-    expect(double.assignments[0]?.data).toEqual({
+    expect(double.nativeUpdates[0]).toEqual({
+      entityType: WagerTransactionPersistenceEntity,
+      where: { id: TRANSACTION_ID },
+      data: {
       status: 'PROCESSED',
       referenceTransactionId: null,
       failureCode: null,
@@ -279,7 +316,9 @@ describe('MikroORM repositories', () => {
       resultBalanceCurrency: 'BRL',
       referenceAttempts: 0,
       nextReferenceAttemptAt: null,
+      },
     });
+    expect(double.refreshed).toEqual([persistenceEntity]);
   });
 
   test('keeps the ledger repository append-only', async () => {

@@ -33,6 +33,9 @@ export interface WalletReconciliationRepository {
 
 export interface WagerTransactionRepository {
   findById(id: string): Promise<WagerTransactionRecord | undefined>;
+  findNextPendingReferenceDueForUpdate(
+    now: Date,
+  ): Promise<WagerTransactionRecord | undefined>;
   findByIdempotencyKey(
     idempotencyKey: string,
   ): Promise<WagerTransactionRecord | undefined>;

@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { ConfigModule, ConfigService } from '@nestjs/config';
 
 import type { Clock } from '../application/ports/clock.js';
 import { CLOCK } from '../application/ports/clock.js';
@@ -11,6 +12,7 @@ import {
   type WagerTransactionProcessor,
 } from '../application/ports/wager-transaction-processor.js';
 import { PersistentWagerTransactionProcessor } from '../application/services/persistent-wager-transaction.processor.js';
+import { PendingReferenceRetryPolicy } from '../application/services/pending-reference-retry.policy.js';
 import { WagerPayloadFingerprintService } from '../application/services/wager-payload-fingerprint.js';
 import { WagerTransactionExecutor } from '../application/services/wager-transaction.executor.js';
 import {
@@ -18,6 +20,7 @@ import {
   GetWagerTransactionByIdUseCase,
 } from '../application/use-cases/wagering/get-wager-transaction.use-cases.js';
 import { ProcessWagerTransactionUseCase } from '../application/use-cases/wagering/process-wager-transaction.use-case.js';
+import type { EnvironmentVariables } from '../config/environment.schema.js';
 import { Sha256PayloadDigest } from '../infrastructure/cryptography/sha256-payload-digest.js';
 import { UuidGenerator } from '../infrastructure/identity/uuid-generator.js';
 import { MikroOrmPersistenceConflictClassifier } from '../infrastructure/persistence/mikro-orm-persistence-conflict.classifier.js';
@@ -25,17 +28,30 @@ import { PersistenceModule } from '../infrastructure/persistence/persistence.mod
 import { SystemClock } from '../infrastructure/time/system-clock.js';
 
 @Module({
-  imports: [PersistenceModule],
+  imports: [ConfigModule, PersistenceModule],
   providers: [
     { provide: CLOCK, useClass: SystemClock },
     { provide: ID_GENERATOR, useClass: UuidGenerator },
     Sha256PayloadDigest,
     MikroOrmPersistenceConflictClassifier,
     {
+      provide: PendingReferenceRetryPolicy,
+      inject: [ConfigService],
+      useFactory: (config: ConfigService<EnvironmentVariables, true>) =>
+        new PendingReferenceRetryPolicy(
+          config.get('PENDING_REFERENCE_RETRY_BASE_SECONDS', { infer: true }),
+          config.get('PENDING_REFERENCE_RETRY_MAX_SECONDS', { infer: true }),
+          config.get('PENDING_REFERENCE_TTL_SECONDS', { infer: true }),
+        ),
+    },
+    {
       provide: WagerTransactionExecutor,
-      inject: [ID_GENERATOR, CLOCK],
-      useFactory: (idGenerator: IdGenerator, clock: Clock) =>
-        new WagerTransactionExecutor(idGenerator, clock),
+      inject: [ID_GENERATOR, CLOCK, PendingReferenceRetryPolicy],
+      useFactory: (
+        idGenerator: IdGenerator,
+        clock: Clock,
+        retryPolicy: PendingReferenceRetryPolicy,
+      ) => new WagerTransactionExecutor(idGenerator, clock, retryPolicy),
     },
     {
       provide: WAGER_TRANSACTION_PROCESSOR,
@@ -83,6 +99,7 @@ import { SystemClock } from '../infrastructure/time/system-clock.js';
     },
   ],
   exports: [
+    WagerTransactionExecutor,
     ProcessWagerTransactionUseCase,
     GetWagerTransactionByIdUseCase,
     GetProviderWagerTransactionUseCase,

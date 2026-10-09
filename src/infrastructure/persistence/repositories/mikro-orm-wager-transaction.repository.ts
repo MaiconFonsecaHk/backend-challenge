@@ -25,6 +25,32 @@ export class MikroOrmWagerTransactionRepository
       : WagerTransactionPersistenceMapper.toRecord(entity);
   }
 
+  async findNextPendingReferenceDueForUpdate(
+    now: Date,
+  ): Promise<WagerTransactionRecord | undefined> {
+    const rows = await this.entityManager.execute<Array<{ id: string }>>(
+      `select candidate.id
+         from wager_transactions candidate
+        where candidate.status = 'PENDING_REFERENCE'
+          and (
+            candidate.next_reference_attempt_at is null
+            or candidate.next_reference_attempt_at <= ?
+          )
+        order by candidate.next_reference_attempt_at asc nulls first,
+                 candidate.id asc
+        limit 1
+        for update of candidate skip locked`,
+      [now],
+      'all',
+    );
+    const claimed = rows[0];
+    if (claimed === undefined) {
+      return undefined;
+    }
+
+    return this.findById(claimed.id);
+  }
+
   async findByIdempotencyKey(
     idempotencyKey: string,
   ): Promise<WagerTransactionRecord | undefined> {
@@ -90,7 +116,7 @@ export class MikroOrmWagerTransactionRepository
     }
 
     const state = WagerTransactionPersistenceMapper.toPersistence(record);
-    this.entityManager.assign(entity, {
+    const transition = {
       status: state.status,
       referenceTransactionId: state.referenceTransactionId,
       failureCode: state.failureCode,
@@ -99,6 +125,13 @@ export class MikroOrmWagerTransactionRepository
       resultBalanceCurrency: state.resultBalanceCurrency,
       referenceAttempts: state.referenceAttempts,
       nextReferenceAttemptAt: state.nextReferenceAttemptAt,
-    });
+    };
+
+    await this.entityManager.nativeUpdate(
+      WagerTransactionPersistenceEntity,
+      { id: transaction.id },
+      transition,
+    );
+    await this.entityManager.refresh(entity);
   }
 }

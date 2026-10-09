@@ -8,6 +8,7 @@ import type {
   NewWagerTransactionExecutor,
   WagerTransactionProcessingCommand,
 } from '../ports/wager-transaction-processor.js';
+import { PendingReferenceRetryPolicy } from './pending-reference-retry.policy.js';
 import {
   WagerTransactionPendingReference,
   WagerTransactionProcessed,
@@ -22,6 +23,7 @@ import { InvalidTransactionReferenceError } from '../../domain/wagering/wager-tr
 import {
   WagerTransaction,
   WagerTransactionKind,
+  WagerTransactionStatus,
 } from '../../domain/wagering/wager-transaction.js';
 import { InsufficientFundsError } from '../../domain/wallet/wallet.error.js';
 import type { Wallet, WalletBalanceChange } from '../../domain/wallet/wallet.js';
@@ -29,6 +31,7 @@ import type { Wallet, WalletBalanceChange } from '../../domain/wallet/wallet.js'
 export const WAGER_FAILURE_CODES = Object.freeze({
   insufficientFunds: 'INSUFFICIENT_FUNDS',
   invalidReference: 'INVALID_TRANSACTION_REFERENCE',
+  referenceNotFound: 'REFERENCE_NOT_FOUND',
   referenceAlreadyReversed: 'REFERENCE_ALREADY_REVERSED',
   reversalInsufficientFunds: 'REVERSAL_INSUFFICIENT_FUNDS',
 } as const);
@@ -37,6 +40,7 @@ export class WagerTransactionExecutor implements NewWagerTransactionExecutor {
   constructor(
     private readonly idGenerator: IdGenerator,
     private readonly clock: Clock,
+    private readonly pendingReferenceRetryPolicy: PendingReferenceRetryPolicy,
   ) {}
 
   async execute(
@@ -62,11 +66,9 @@ export class WagerTransactionExecutor implements NewWagerTransactionExecutor {
     });
 
     const reference = await this.resolveReference(transaction, repositories);
-    if (
-      transaction.referenceExternalTransactionId !== undefined &&
-      reference === undefined
-    ) {
+    if (this.referenceCanStillBecomeProcessable(transaction, reference)) {
       transaction.markPendingReference();
+      const retry = this.requireNextReferenceRetry(transaction, 0, occurredAt);
       await this.enqueueTransactionEvent(
         transaction,
         command.correlationId,
@@ -74,19 +76,97 @@ export class WagerTransactionExecutor implements NewWagerTransactionExecutor {
         repositories,
       );
 
-      return this.record(transaction, wallet);
+      return this.record(
+        transaction,
+        wallet,
+        retry.attempts,
+        retry.nextAttemptAt,
+      );
     }
+
+    return this.processResolvedTransaction(
+      transaction,
+      wallet,
+      reference,
+      repositories,
+      occurredAt,
+      command.correlationId,
+      0,
+    );
+  }
+
+  async resumePendingReference(
+    record: WagerTransactionRecord,
+    wallet: Wallet,
+    repositories: PersistenceRepositories,
+  ): Promise<WagerTransactionRecord> {
+    const { transaction } = record;
+    if (transaction.status !== WagerTransactionStatus.PendingReference) {
+      throw new Error('Only a pending-reference transaction can be resumed.');
+    }
+
+    const attemptedAt = this.clock.now();
+    const reference = await this.resolveReference(transaction, repositories);
+    if (this.referenceCanStillBecomeProcessable(transaction, reference)) {
+      const retry = this.pendingReferenceRetryPolicy.nextRetry(
+        record.referenceAttempts,
+        transaction.createdAt,
+        attemptedAt,
+      );
+      if (retry !== undefined) {
+        return this.record(
+          transaction,
+          wallet,
+          retry.attempts,
+          retry.nextAttemptAt,
+        );
+      }
+
+      transaction.reject(WAGER_FAILURE_CODES.referenceNotFound, attemptedAt);
+      await this.enqueueTransactionEvent(
+        transaction,
+        transaction.id,
+        attemptedAt,
+        repositories,
+      );
+      return this.record(
+        transaction,
+        wallet,
+        record.referenceAttempts + 1,
+      );
+    }
+
+    return this.processResolvedTransaction(
+      transaction,
+      wallet,
+      reference,
+      repositories,
+      attemptedAt,
+      transaction.id,
+      record.referenceAttempts,
+    );
+  }
+
+  private async processResolvedTransaction(
+    transaction: WagerTransaction,
+    wallet: Wallet,
+    reference: WagerTransactionRecord | undefined,
+    repositories: PersistenceRepositories,
+    occurredAt: Date,
+    correlationId: string,
+    referenceAttempts: number,
+  ): Promise<WagerTransactionRecord> {
 
     if (transaction.kind === WagerTransactionKind.Loss) {
       transaction.markProcessed(undefined, occurredAt);
       await this.enqueueTransactionEvent(
         transaction,
-        command.correlationId,
+        correlationId,
         occurredAt,
         repositories,
       );
 
-      return this.record(transaction, wallet);
+      return this.record(transaction, wallet, referenceAttempts);
     }
 
     let direction: LedgerDirection;
@@ -100,12 +180,12 @@ export class WagerTransactionExecutor implements NewWagerTransactionExecutor {
       transaction.reject(WAGER_FAILURE_CODES.invalidReference, occurredAt);
       await this.enqueueTransactionEvent(
         transaction,
-        command.correlationId,
+        correlationId,
         occurredAt,
         repositories,
       );
 
-      return this.record(transaction, wallet);
+      return this.record(transaction, wallet, referenceAttempts);
     }
 
     if (transaction.requiresReference() && reference !== undefined) {
@@ -121,12 +201,12 @@ export class WagerTransactionExecutor implements NewWagerTransactionExecutor {
         );
         await this.enqueueTransactionEvent(
           transaction,
-          command.correlationId,
+          correlationId,
           occurredAt,
           repositories,
         );
 
-        return this.record(transaction, wallet);
+        return this.record(transaction, wallet, referenceAttempts);
       }
     }
 
@@ -148,12 +228,12 @@ export class WagerTransactionExecutor implements NewWagerTransactionExecutor {
       transaction.reject(failureCode, occurredAt);
       await this.enqueueTransactionEvent(
         transaction,
-        command.correlationId,
+        correlationId,
         occurredAt,
         repositories,
       );
 
-      return this.record(transaction, wallet);
+      return this.record(transaction, wallet, referenceAttempts);
     }
 
     transaction.markProcessed(reference?.transaction.id, occurredAt);
@@ -172,7 +252,7 @@ export class WagerTransactionExecutor implements NewWagerTransactionExecutor {
     await repositories.walletLedgerEntries.add(ledgerEntry);
     await this.enqueueTransactionEvent(
       transaction,
-      command.correlationId,
+      correlationId,
       occurredAt,
       repositories,
     );
@@ -180,12 +260,39 @@ export class WagerTransactionExecutor implements NewWagerTransactionExecutor {
       transaction,
       wallet,
       ledgerEntry,
-      command.correlationId,
+      correlationId,
       occurredAt,
       repositories,
     );
 
-    return this.record(transaction, wallet);
+    return this.record(transaction, wallet, referenceAttempts);
+  }
+
+  private referenceCanStillBecomeProcessable(
+    transaction: WagerTransaction,
+    reference: WagerTransactionRecord | undefined,
+  ): boolean {
+    return (
+      transaction.referenceExternalTransactionId !== undefined &&
+      (reference === undefined || !reference.transaction.isTerminal())
+    );
+  }
+
+  private requireNextReferenceRetry(
+    transaction: WagerTransaction,
+    currentAttempts: number,
+    attemptedAt: Date,
+  ) {
+    const retry = this.pendingReferenceRetryPolicy.nextRetry(
+      currentAttempts,
+      transaction.createdAt,
+      attemptedAt,
+    );
+    if (retry === undefined) {
+      throw new Error('A new pending reference cannot already be expired.');
+    }
+
+    return retry;
   }
 
   private async resolveReference(
@@ -260,11 +367,16 @@ export class WagerTransactionExecutor implements NewWagerTransactionExecutor {
   private record(
     transaction: WagerTransaction,
     wallet: Wallet,
+    referenceAttempts: number,
+    nextReferenceAttemptAt?: Date,
   ): WagerTransactionRecord {
     return Object.freeze({
       transaction,
       resultBalance: wallet.balance,
-      referenceAttempts: 0,
+      referenceAttempts,
+      ...(nextReferenceAttemptAt === undefined
+        ? {}
+        : { nextReferenceAttemptAt }),
     });
   }
 }

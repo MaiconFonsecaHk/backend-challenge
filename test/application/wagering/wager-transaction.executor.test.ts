@@ -14,6 +14,7 @@ import {
   WAGER_FAILURE_CODES,
   WagerTransactionExecutor,
 } from '../../../src/application/services/wager-transaction.executor.js';
+import { PendingReferenceRetryPolicy } from '../../../src/application/services/pending-reference-retry.policy.js';
 import { LedgerDirection } from '../../../src/domain/ledger/ledger-direction.js';
 import type { WalletLedgerEntry } from '../../../src/domain/ledger/wallet-ledger-entry.js';
 import type { OutboxMessage } from '../../../src/domain/messaging/outbox-message.js';
@@ -33,6 +34,18 @@ const REFERENCE_ID = '30000000-0000-4000-8000-000000000700';
 class FixedClock implements Clock {
   now(): Date {
     return new Date(OCCURRED_AT.getTime());
+  }
+}
+
+class MutableClock implements Clock {
+  constructor(private current: Date) {}
+
+  now(): Date {
+    return new Date(this.current.getTime());
+  }
+
+  set(current: Date): void {
+    this.current = new Date(current.getTime());
   }
 }
 
@@ -63,7 +76,7 @@ class WalletRepositoryDouble implements Partial<WalletRepository> {
 class WagerRepositoryDouble implements Partial<WagerTransactionRepository> {
   reversal: WagerTransactionRecord | undefined;
 
-  constructor(readonly reference?: WagerTransactionRecord) {}
+  constructor(public reference?: WagerTransactionRecord) {}
 
   async findByProviderTransaction(): Promise<WagerTransactionRecord | undefined> {
     return this.reference;
@@ -179,6 +192,8 @@ function processedReference(
 function createHarness(
   reference?: WagerTransactionRecord,
   idCount = 6,
+  clock: Clock = new FixedClock(),
+  retryPolicy = new PendingReferenceRetryPolicy(30, 3_600, 86_400),
 ): Harness {
   const wallets = new WalletRepositoryDouble();
   const wagers = new WagerRepositoryDouble(reference);
@@ -199,7 +214,8 @@ function createHarness(
   return {
     executor: new WagerTransactionExecutor(
       new SequenceIdGenerator(ids),
-      new FixedClock(),
+      clock,
+      retryPolicy,
     ),
     repositories,
     wallets,
@@ -353,11 +369,90 @@ describe('WagerTransactionExecutor', () => {
     );
 
     expect(record.transaction.status).toBe(WagerTransactionStatus.PendingReference);
-    expect(record.referenceAttempts).toBe(0);
+    expect(record.referenceAttempts).toBe(1);
+    expect(record.nextReferenceAttemptAt?.toISOString()).toBe(
+      '2026-10-08T20:00:30.000Z',
+    );
     expect(target.version).toBe(1);
     expect(harness.wallets.saved).toEqual([]);
     expect(harness.ledger.added).toEqual([]);
     expect(eventTypes(harness)).toEqual(['WagerTransactionPendingReference']);
+  });
+
+  test('resumes a pending reference atomically when the referenced transaction appears', async () => {
+    const clock = new MutableClock(OCCURRED_AT);
+    const harness = createHarness(undefined, 6, clock);
+    const target = wallet();
+    const pending = await harness.executor.execute(
+      command(WagerTransactionKind.Refund),
+      target,
+      harness.repositories,
+    );
+    harness.wagers.reference = processedReference(WagerTransactionKind.Bet);
+    clock.set(new Date('2026-10-08T20:00:30.000Z'));
+
+    const resolved = await harness.executor.resumePendingReference(
+      pending,
+      target,
+      harness.repositories,
+    );
+
+    expect(resolved.transaction.status).toBe(WagerTransactionStatus.Processed);
+    expect(resolved.transaction.referenceTransactionId).toBe(REFERENCE_ID);
+    expect(resolved.referenceAttempts).toBe(1);
+    expect(resolved.nextReferenceAttemptAt).toBeUndefined();
+    expect(target.balance.toJSON().amount).toBe('125.00');
+    expect(harness.ledger.added).toHaveLength(1);
+    expect(eventTypes(harness)).toEqual([
+      'WagerTransactionPendingReference',
+      'WagerTransactionProcessed',
+      'WalletBalanceChanged',
+    ]);
+  });
+
+  test('reschedules an unresolved reference and rejects it auditably at the TTL', async () => {
+    const clock = new MutableClock(OCCURRED_AT);
+    const retryPolicy = new PendingReferenceRetryPolicy(30, 120, 300);
+    const harness = createHarness(undefined, 4, clock, retryPolicy);
+    const target = wallet();
+    const pending = await harness.executor.execute(
+      command(WagerTransactionKind.Refund),
+      target,
+      harness.repositories,
+    );
+    clock.set(new Date('2026-10-08T20:00:30.000Z'));
+
+    const rescheduled = await harness.executor.resumePendingReference(
+      pending,
+      target,
+      harness.repositories,
+    );
+    expect(rescheduled.transaction.status).toBe(
+      WagerTransactionStatus.PendingReference,
+    );
+    expect(rescheduled.referenceAttempts).toBe(2);
+    expect(rescheduled.nextReferenceAttemptAt?.toISOString()).toBe(
+      '2026-10-08T20:01:30.000Z',
+    );
+
+    clock.set(new Date('2026-10-08T20:05:00.000Z'));
+    const expired = await harness.executor.resumePendingReference(
+      rescheduled,
+      target,
+      harness.repositories,
+    );
+    expect(expired.transaction.status).toBe(WagerTransactionStatus.Rejected);
+    expect(expired.transaction.failureCode).toBe(
+      WAGER_FAILURE_CODES.referenceNotFound,
+    );
+    expect(expired.referenceAttempts).toBe(3);
+    expect(expired.nextReferenceAttemptAt).toBeUndefined();
+    expect(target.balance.toJSON().amount).toBe('100.00');
+    expect(harness.ledger.added).toEqual([]);
+    expect(eventTypes(harness)).toEqual([
+      'WagerTransactionPendingReference',
+      'WagerTransactionRejected',
+    ]);
   });
 
   test.each([

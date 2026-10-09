@@ -53,6 +53,35 @@ const sqsEnvironmentSchema = z.object({
     .min(1)
     .max(43_200)
     .default(300),
+  PENDING_REFERENCE_BATCH_SIZE: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .max(100)
+    .default(10),
+  PENDING_REFERENCE_POLL_INTERVAL_MS: z.coerce
+    .number()
+    .int()
+    .min(50)
+    .max(60_000)
+    .default(1_000),
+  PENDING_REFERENCE_RETRY_BASE_SECONDS: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .max(3_600)
+    .default(30),
+  PENDING_REFERENCE_RETRY_MAX_SECONDS: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .max(43_200)
+    .default(3_600),
+  PENDING_REFERENCE_TTL_SECONDS: z.coerce
+    .number()
+    .int()
+    .min(60)
+    .max(2_592_000),
 });
 
 export const environmentSchema = runtimeEnvironmentSchema
@@ -92,6 +121,30 @@ export const environmentSchema = runtimeEnvironmentSchema
         message:
           'OUTBOX_RETRY_MAX_SECONDS must be greater than or equal to OUTBOX_RETRY_BASE_SECONDS',
         path: ['OUTBOX_RETRY_MAX_SECONDS'],
+      });
+    }
+
+    if (
+      environment.PENDING_REFERENCE_RETRY_MAX_SECONDS <
+      environment.PENDING_REFERENCE_RETRY_BASE_SECONDS
+    ) {
+      context.addIssue({
+        code: 'custom',
+        message:
+          'PENDING_REFERENCE_RETRY_MAX_SECONDS must be greater than or equal to PENDING_REFERENCE_RETRY_BASE_SECONDS',
+        path: ['PENDING_REFERENCE_RETRY_MAX_SECONDS'],
+      });
+    }
+
+    if (
+      environment.PENDING_REFERENCE_RETRY_MAX_SECONDS >
+      environment.PENDING_REFERENCE_TTL_SECONDS
+    ) {
+      context.addIssue({
+        code: 'custom',
+        message:
+          'PENDING_REFERENCE_RETRY_MAX_SECONDS must be less than or equal to PENDING_REFERENCE_TTL_SECONDS',
+        path: ['PENDING_REFERENCE_RETRY_MAX_SECONDS'],
       });
     }
   });

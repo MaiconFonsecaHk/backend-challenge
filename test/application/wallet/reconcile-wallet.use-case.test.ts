@@ -39,6 +39,7 @@ function reconciliationContext(snapshot?: WalletReconciliationSnapshot): {
     },
     wagerTransactions: {
       findById: async () => undefined,
+      findNextPendingReferenceDueForUpdate: async () => undefined,
       findByIdempotencyKey: async () => undefined,
       findByProviderTransaction: async () => undefined,
       findByReferenceAndKind: async () => undefined,

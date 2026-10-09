@@ -11,6 +11,7 @@ const validEnvironment = {
   POSTGRES_USER: 'backend_challenge',
   SQS_ENDPOINT: 'http://127.0.0.1:4566',
   INTEGRATION_EVENTS_QUEUE_NAME: 'integration-events.fifo',
+  PENDING_REFERENCE_TTL_SECONDS: '86400',
   WAGER_TRANSACTIONS_DLQ_NAME: 'wager-transactions-dlq.fifo',
   WAGER_TRANSACTIONS_QUEUE_NAME: 'wager-transactions.fifo',
 } as const;
@@ -30,6 +31,11 @@ test('parses and normalizes a valid application environment', () => {
     OUTBOX_POLL_INTERVAL_MS: 1_000,
     OUTBOX_RETRY_BASE_SECONDS: 5,
     OUTBOX_RETRY_MAX_SECONDS: 300,
+    PENDING_REFERENCE_BATCH_SIZE: 10,
+    PENDING_REFERENCE_POLL_INTERVAL_MS: 1_000,
+    PENDING_REFERENCE_RETRY_BASE_SECONDS: 30,
+    PENDING_REFERENCE_RETRY_MAX_SECONDS: 3_600,
+    PENDING_REFERENCE_TTL_SECONDS: 86_400,
   });
 });
 
@@ -60,4 +66,26 @@ test('rejects an outbox retry cap below its base delay', () => {
   });
 
   expect(result.success).toBeFalse();
+});
+
+test('requires an explicit pending-reference TTL', () => {
+  const { PENDING_REFERENCE_TTL_SECONDS: _, ...withoutTtl } = validEnvironment;
+
+  expect(environmentSchema.safeParse(withoutTtl).success).toBeFalse();
+});
+
+test('rejects pending-reference delays above their cap or TTL', () => {
+  expect(
+    environmentSchema.safeParse({
+      ...validEnvironment,
+      PENDING_REFERENCE_RETRY_BASE_SECONDS: '60',
+      PENDING_REFERENCE_RETRY_MAX_SECONDS: '30',
+    }).success,
+  ).toBeFalse();
+  expect(
+    environmentSchema.safeParse({
+      ...validEnvironment,
+      PENDING_REFERENCE_RETRY_MAX_SECONDS: '90000',
+    }).success,
+  ).toBeFalse();
 });

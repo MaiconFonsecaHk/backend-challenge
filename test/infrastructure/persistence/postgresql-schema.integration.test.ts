@@ -21,6 +21,7 @@ import type {
   WagerTransactionProcessingCommand,
 } from '../../../src/application/ports/wager-transaction-processor.js';
 import { PersistentWagerTransactionProcessor } from '../../../src/application/services/persistent-wager-transaction.processor.js';
+import { PendingReferenceRetryPolicy } from '../../../src/application/services/pending-reference-retry.policy.js';
 import { ExponentialOutboxRetryPolicy } from '../../../src/application/services/exponential-outbox-retry.policy.js';
 import { WagerPayloadFingerprintService } from '../../../src/application/services/wager-payload-fingerprint.js';
 import { WagerTransactionExecutor } from '../../../src/application/services/wager-transaction.executor.js';
@@ -30,6 +31,7 @@ import {
 } from '../../../src/application/use-cases/wagering/get-wager-transaction.use-cases.js';
 import { ProcessWagerTransactionUseCase } from '../../../src/application/use-cases/wagering/process-wager-transaction.use-case.js';
 import { PublishOutboxBatchUseCase } from '../../../src/application/use-cases/messaging/publish-outbox-batch.use-case.js';
+import { ProcessPendingReferencesBatchUseCase } from '../../../src/application/use-cases/wagering/process-pending-references-batch.use-case.js';
 import { CreateWalletUseCase } from '../../../src/application/use-cases/wallet/create-wallet.use-case.js';
 import { GetWalletLedgerUseCase } from '../../../src/application/use-cases/wallet/get-wallet-ledger.use-case.js';
 import { GetWalletUseCase } from '../../../src/application/use-cases/wallet/get-wallet.use-case.js';
@@ -280,7 +282,10 @@ function money(amount: string): Money {
   return Money.from({ amount, currency: 'BRL' });
 }
 
-function createFinancialUseCase(orm: MikroORM): ProcessWagerTransactionUseCase {
+function createFinancialUseCase(
+  orm: MikroORM,
+  now: Date = PROCESSED_AT,
+): ProcessWagerTransactionUseCase {
   const unitOfWork = new MikroOrmUnitOfWork(orm);
 
   return new ProcessWagerTransactionUseCase(
@@ -288,11 +293,28 @@ function createFinancialUseCase(orm: MikroORM): ProcessWagerTransactionUseCase {
       unitOfWork,
       new WagerTransactionExecutor(
         new UuidGenerator(),
-        new FixedClock(PROCESSED_AT),
+        new FixedClock(now),
+        new PendingReferenceRetryPolicy(30, 3_600, 86_400),
       ),
       new MikroOrmPersistenceConflictClassifier(),
     ),
     new WagerPayloadFingerprintService(new Sha256PayloadDigest()),
+  );
+}
+
+function createPendingReferenceUseCase(
+  orm: MikroORM,
+  now: Date,
+): ProcessPendingReferencesBatchUseCase {
+  const clock = new FixedClock(now);
+  return new ProcessPendingReferencesBatchUseCase(
+    new MikroOrmUnitOfWork(orm),
+    new WagerTransactionExecutor(
+      new UuidGenerator(),
+      clock,
+      new PendingReferenceRetryPolicy(30, 3_600, 86_400),
+    ),
+    clock,
   );
 }
 
@@ -779,6 +801,233 @@ describePostgreSql('PostgreSQL schema integration', () => {
     expect(publishedMessage?.publishedAt?.toISOString()).toBe(
       '2026-10-08T12:01:05.000Z',
     );
+  });
+
+  test('recovers a refund delivered before its reference without breaking ledger consistency', async () => {
+    const walletId = '10000000-0000-4000-8000-000000000931';
+    const playerId = '20000000-0000-4000-8000-000000000931';
+    const unitOfWork = new MikroOrmUnitOfWork(requiredApplicationOrm());
+    await new CreateWalletUseCase(
+      unitOfWork,
+      new SequenceIdGenerator([
+        walletId,
+        '30000000-0000-4000-8000-000000000931',
+        '40000000-0000-4000-8000-000000000931',
+        '50000000-0000-4000-8000-000000000931',
+      ]),
+      new FixedClock(CREATED_AT),
+    ).execute({
+      playerId,
+      initialBalance: { amount: '100.00', currency: 'BRL' },
+      correlationId: 'wallet-create-reference-931',
+    });
+    const financial = createFinancialUseCase(requiredApplicationOrm());
+    const submit = (
+      externalTransactionId: string,
+      kind: WagerTransactionKind,
+      referenceExternalTransactionId?: string,
+    ) =>
+      financial.execute({
+        providerId: 'provider-reference-931',
+        externalTransactionId,
+        idempotencyKey: `provider-reference-931:${externalTransactionId}`,
+        playerId,
+        walletId,
+        roundId: 'round-reference-931',
+        gameId: 'game-reference-931',
+        kind,
+        money: { amount: '25.00', currency: 'BRL' },
+        ...(referenceExternalTransactionId === undefined
+          ? {}
+          : { referenceExternalTransactionId }),
+        correlationId: `correlation-${externalTransactionId}`,
+      });
+
+    const refund = await submit(
+      'refund-before-bet-931',
+      WagerTransactionKind.Refund,
+      'bet-after-refund-931',
+    );
+    expect(refund.status).toBe(WagerTransactionStatus.PendingReference);
+    const pending = await unitOfWork.execute((repositories) =>
+      repositories.wagerTransactions.findById(refund.transactionId),
+    );
+    expect(pending?.referenceAttempts).toBe(1);
+    expect(pending?.nextReferenceAttemptAt?.toISOString()).toBe(
+      '2026-10-08T12:01:30.000Z',
+    );
+
+    const bet = await submit(
+      'bet-after-refund-931',
+      WagerTransactionKind.Bet,
+    );
+    expect(bet).toMatchObject({
+      status: WagerTransactionStatus.Processed,
+      balance: { amount: '75.00', currency: 'BRL' },
+    });
+
+    const claimLog: string[] = [];
+    const [abandonedClaimOrm, competingClaimOrm] = await Promise.all([
+      createIndependentApplicationOrm(claimLog),
+      createIndependentApplicationOrm(claimLog),
+    ]);
+    let announceClaim!: () => void;
+    const claimStarted = new Promise<void>((resolve) => {
+      announceClaim = resolve;
+    });
+    let releaseClaim!: () => void;
+    const claimRelease = new Promise<void>((resolve) => {
+      releaseClaim = resolve;
+    });
+    try {
+      const abandonedClaim = new MikroOrmUnitOfWork(
+        abandonedClaimOrm,
+      ).execute(async (repositories) => {
+        const claimed =
+          await repositories.wagerTransactions.findNextPendingReferenceDueForUpdate(
+            new Date('2026-10-08T12:01:30.000Z'),
+          );
+        expect(claimed?.transaction.id).toBe(refund.transactionId);
+        announceClaim();
+        await claimRelease;
+        throw new Error('simulated worker termination');
+      });
+      await claimStarted;
+
+      const competingClaim = await new MikroOrmUnitOfWork(
+        competingClaimOrm,
+      ).execute((repositories) =>
+        repositories.wagerTransactions.findNextPendingReferenceDueForUpdate(
+          new Date('2026-10-08T12:01:30.000Z'),
+        ),
+      );
+      expect(competingClaim).toBeUndefined();
+
+      releaseClaim();
+      await expect(abandonedClaim).rejects.toThrow(
+        'simulated worker termination',
+      );
+    } finally {
+      releaseClaim();
+      await Promise.all([
+        abandonedClaimOrm.close(true),
+        competingClaimOrm.close(true),
+      ]);
+    }
+    expect(
+      claimLog.some((query) =>
+        query.toLowerCase().includes('skip locked'),
+      ),
+    ).toBeTrue();
+
+    const recovery = createPendingReferenceUseCase(
+      requiredApplicationOrm(),
+      new Date('2026-10-08T12:01:30.000Z'),
+    );
+    expect(await recovery.execute(10)).toEqual({
+      claimed: 1,
+      processed: 1,
+      rejected: 0,
+      rescheduled: 0,
+    });
+
+    const recovered = await unitOfWork.execute((repositories) =>
+      repositories.wagerTransactions.findById(refund.transactionId),
+    );
+    expect(recovered?.transaction.status).toBe(
+      WagerTransactionStatus.Processed,
+    );
+    expect(recovered?.transaction.referenceTransactionId).toBe(
+      bet.transactionId,
+    );
+    expect(recovered?.referenceAttempts).toBe(1);
+    expect(recovered?.nextReferenceAttemptAt).toBeUndefined();
+
+    const reconciliation = await new ReconcileWalletUseCase(unitOfWork).execute(
+      walletId,
+    );
+    expect(reconciliation).toMatchObject({
+      storedBalance: { amount: '100.00', currency: 'BRL' },
+      calculatedBalance: { amount: '100.00', currency: 'BRL' },
+      consistent: true,
+      checkedEntries: 3,
+    });
+  });
+
+  test('rejects an expired missing reference and emits an auditable terminal event', async () => {
+    const walletId = '10000000-0000-4000-8000-000000000932';
+    const playerId = '20000000-0000-4000-8000-000000000932';
+    const unitOfWork = new MikroOrmUnitOfWork(requiredApplicationOrm());
+    await new CreateWalletUseCase(
+      unitOfWork,
+      new SequenceIdGenerator([walletId]),
+      new FixedClock(CREATED_AT),
+    ).execute({
+      playerId,
+      initialBalance: { amount: '0.00', currency: 'BRL' },
+      correlationId: 'wallet-create-reference-932',
+    });
+    const pending = await createFinancialUseCase(
+      requiredApplicationOrm(),
+    ).execute({
+      providerId: 'provider-reference-932',
+      externalTransactionId: 'refund-missing-932',
+      idempotencyKey: 'provider-reference-932:refund-missing-932',
+      playerId,
+      walletId,
+      roundId: 'round-reference-932',
+      gameId: 'game-reference-932',
+      kind: WagerTransactionKind.Refund,
+      money: { amount: '25.00', currency: 'BRL' },
+      referenceExternalTransactionId: 'missing-bet-932',
+      correlationId: 'correlation-refund-missing-932',
+    });
+    const expiredAt = new Date(
+      PROCESSED_AT.getTime() + 86_400 * 1_000,
+    );
+
+    expect(
+      await createPendingReferenceUseCase(
+        requiredApplicationOrm(),
+        expiredAt,
+      ).execute(10),
+    ).toEqual({
+      claimed: 1,
+      processed: 0,
+      rejected: 1,
+      rescheduled: 0,
+    });
+
+    const rejected = await unitOfWork.execute((repositories) =>
+      repositories.wagerTransactions.findById(pending.transactionId),
+    );
+    expect(rejected?.transaction.status).toBe(
+      WagerTransactionStatus.Rejected,
+    );
+    expect(rejected?.transaction.failureCode).toBe('REFERENCE_NOT_FOUND');
+    expect(rejected?.transaction.processedAt?.toISOString()).toBe(
+      expiredAt.toISOString(),
+    );
+    expect(rejected?.nextReferenceAttemptAt).toBeUndefined();
+
+    const rejectionEvents = await requiredApplicationOrm().em
+      .getConnection()
+      .execute<Array<{ count: string }>>(
+        `select count(*)::text as count
+           from outbox_messages
+          where aggregate_id = ?
+            and event_type = 'WagerTransactionRejected'`,
+        [pending.transactionId],
+      );
+    expect(rejectionEvents[0]?.count).toBe('1');
+    expect(
+      await new ReconcileWalletUseCase(unitOfWork).execute(walletId),
+    ).toMatchObject({
+      storedBalance: { amount: '0.00', currency: 'BRL' },
+      calculatedBalance: { amount: '0.00', currency: 'BRL' },
+      consistent: true,
+      checkedEntries: 0,
+    });
   });
 
   test('commits and rehydrates a complete opening without monetary precision loss', async () => {
@@ -1441,6 +1690,7 @@ describePostgreSql('PostgreSQL schema integration', () => {
           '50000000-0000-4000-8000-000000000214',
         ]),
         new FixedClock(PROCESSED_AT),
+        new PendingReferenceRetryPolicy(30, 3_600, 86_400),
       ),
       new MikroOrmPersistenceConflictClassifier(),
     );
