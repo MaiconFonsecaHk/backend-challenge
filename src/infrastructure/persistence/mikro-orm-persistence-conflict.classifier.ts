@@ -4,6 +4,7 @@ import type { PersistenceConflictClassifier } from '../../application/ports/pers
 
 const WAGER_IDEMPOTENCY_CONSTRAINT =
   'wager_transactions_idempotency_key_unique';
+const INBOX_IDENTITY_CONSTRAINT = 'inbox_messages_pkey';
 
 interface ConstraintError {
   readonly constraint?: unknown;
@@ -16,6 +17,13 @@ export class MikroOrmPersistenceConflictClassifier
     return (
       error instanceof UniqueConstraintViolationException &&
       (error as ConstraintError).constraint === WAGER_IDEMPOTENCY_CONSTRAINT
+    );
+  }
+
+  isInboxIdentityConflict(error: unknown): boolean {
+    return (
+      error instanceof UniqueConstraintViolationException &&
+      (error as ConstraintError).constraint === INBOX_IDENTITY_CONSTRAINT
     );
   }
 }

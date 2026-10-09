@@ -1,6 +1,9 @@
 import { describe, expect, test } from 'bun:test';
 
-import { IdempotencyConflictError } from '../../../src/application/errors/wager-application.error.js';
+import {
+  IdempotencyConflictError,
+  InboxPayloadConflictError,
+} from '../../../src/application/errors/wager-application.error.js';
 import type { PersistenceConflictClassifier } from '../../../src/application/ports/persistence/persistence-conflict-classifier.js';
 import type {
   PersistenceRepositories,
@@ -15,6 +18,7 @@ import type {
   WagerTransactionProcessingCommand,
 } from '../../../src/application/ports/wager-transaction-processor.js';
 import { PersistentWagerTransactionProcessor } from '../../../src/application/services/persistent-wager-transaction.processor.js';
+import { InboxMessage } from '../../../src/domain/messaging/inbox-message.js';
 import { Money } from '../../../src/domain/shared/value-objects/money.js';
 import {
   WagerTransaction,
@@ -26,6 +30,12 @@ import { Wallet } from '../../../src/domain/wallet/wallet.js';
 const CREATED_AT = new Date('2026-10-08T18:00:00.000Z');
 const PROCESSED_AT = new Date('2026-10-08T18:00:01.000Z');
 const TRANSACTION_ID = '30000000-0000-4000-8000-000000000601';
+const DELIVERY = Object.freeze({
+  consumerName: 'wager-transactions-consumer',
+  messageId: 'message-601',
+  payloadHash: 'message-payload-hash-601',
+  receivedAt: CREATED_AT,
+});
 
 function command(
   overrides: Partial<WagerTransactionProcessingCommand> = {},
@@ -122,13 +132,34 @@ class WalletRepositoryDouble {
   }
 }
 
+class InboxRepositoryDouble {
+  readonly added: InboxMessage[] = [];
+  readonly saved: InboxMessage[] = [];
+
+  constructor(private readonly found: Array<InboxMessage | undefined> = []) {}
+
+  async findByIdentity(): Promise<InboxMessage | undefined> {
+    return this.found.shift();
+  }
+
+  async add(message: InboxMessage): Promise<void> {
+    this.added.push(message);
+  }
+
+  async save(message: InboxMessage): Promise<void> {
+    this.saved.push(message);
+  }
+}
+
 function repositories(
   wagers: WagerRepositoryDouble,
   wallets = new WalletRepositoryDouble(),
+  inbox = new InboxRepositoryDouble(),
 ): PersistenceRepositories {
   return {
     wagerTransactions: wagers,
     wallets,
+    inboxMessages: inbox,
   } as unknown as PersistenceRepositories;
 }
 
@@ -170,10 +201,17 @@ class ExecutorDouble implements NewWagerTransactionExecutor {
 }
 
 class ConflictClassifierDouble implements PersistenceConflictClassifier {
-  constructor(private readonly matchingError: unknown) {}
+  constructor(
+    private readonly matchingError: unknown,
+    private readonly matchingInboxError?: unknown,
+  ) {}
 
   isWagerIdempotencyKeyConflict(error: unknown): boolean {
     return error === this.matchingError;
+  }
+
+  isInboxIdentityConflict(error: unknown): boolean {
+    return error === this.matchingInboxError;
   }
 }
 
@@ -267,6 +305,86 @@ describe('PersistentWagerTransactionProcessor', () => {
     });
     expect(executor.commands).toEqual([]);
     expect(wagers.added).toEqual([]);
+  });
+
+  test('persists a processed inbox record in the same unit of work as a new wager', async () => {
+    const wagers = new WagerRepositoryDouble([undefined]);
+    const inbox = new InboxRepositoryDouble([undefined]);
+    const processor = new PersistentWagerTransactionProcessor(
+      new UnitOfWorkDouble(repositories(wagers, undefined, inbox)),
+      new ExecutorDouble(transactionRecord()),
+      new ConflictClassifierDouble(undefined),
+    );
+
+    await processor.process(command({ delivery: DELIVERY }));
+
+    expect(inbox.added).toHaveLength(1);
+    expect(inbox.added[0]?.messageId).toBe(DELIVERY.messageId);
+    expect(inbox.added[0]?.payloadHash).toBe(DELIVERY.payloadHash);
+    expect(inbox.added[0]?.processedAt).toEqual(DELIVERY.receivedAt);
+    expect(wagers.added).toHaveLength(1);
+  });
+
+  test('returns the stored wager for an identical processed message redelivery', async () => {
+    const processedInbox = InboxMessage.receive(DELIVERY);
+    processedInbox.markProcessed(DELIVERY.receivedAt);
+    const inbox = new InboxRepositoryDouble([processedInbox]);
+    const executor = new ExecutorDouble(transactionRecord());
+    const processor = new PersistentWagerTransactionProcessor(
+      new UnitOfWorkDouble(
+        repositories(new WagerRepositoryDouble([transactionRecord()]), undefined, inbox),
+      ),
+      executor,
+      new ConflictClassifierDouble(undefined),
+    );
+
+    const result = await processor.process(command({ delivery: DELIVERY }));
+
+    expect(result.idempotentReplay).toBeTrue();
+    expect(executor.commands).toEqual([]);
+    expect(inbox.added).toEqual([]);
+    expect(inbox.saved).toEqual([]);
+  });
+
+  test('rejects a reused inbox identity with a different message payload', async () => {
+    const existingInbox = InboxMessage.receive({
+      ...DELIVERY,
+      payloadHash: 'original-message-hash',
+    });
+    const executor = new ExecutorDouble(transactionRecord());
+    const processor = new PersistentWagerTransactionProcessor(
+      new UnitOfWorkDouble(
+        repositories(
+          new WagerRepositoryDouble([]),
+          undefined,
+          new InboxRepositoryDouble([existingInbox]),
+        ),
+      ),
+      executor,
+      new ConflictClassifierDouble(undefined),
+    );
+
+    await expect(
+      processor.process(command({ delivery: DELIVERY })),
+    ).rejects.toBeInstanceOf(InboxPayloadConflictError);
+    expect(executor.commands).toEqual([]);
+  });
+
+  test('completes an existing unprocessed inbox record after an idempotent wager replay', async () => {
+    const existingInbox = InboxMessage.receive(DELIVERY);
+    const inbox = new InboxRepositoryDouble([existingInbox]);
+    const processor = new PersistentWagerTransactionProcessor(
+      new UnitOfWorkDouble(
+        repositories(new WagerRepositoryDouble([transactionRecord()]), undefined, inbox),
+      ),
+      new ExecutorDouble(transactionRecord()),
+      new ConflictClassifierDouble(undefined),
+    );
+
+    await processor.process(command({ delivery: DELIVERY }));
+
+    expect(inbox.saved).toEqual([existingInbox]);
+    expect(existingInbox.isProcessed()).toBeTrue();
   });
 
   test('rejects a reused key with a different payload before executing effects', async () => {

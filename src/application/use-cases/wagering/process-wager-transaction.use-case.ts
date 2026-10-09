@@ -27,6 +27,12 @@ export interface ProcessWagerTransactionCommand {
   readonly money: MoneyProps;
   readonly referenceExternalTransactionId?: string;
   readonly correlationId: string;
+  readonly delivery?: {
+    readonly consumerName: string;
+    readonly messageId: string;
+    readonly payloadHash: string;
+    readonly receivedAt: Date;
+  };
 }
 
 const EXTERNAL_KINDS = new Set<WagerTransactionKind>([
@@ -93,6 +99,9 @@ export class ProcessWagerTransactionUseCase {
     }
 
     ProcessWagerTransactionUseCase.assertReferenceShape(command);
+    const delivery = ProcessWagerTransactionUseCase.normalizeDelivery(
+      command.delivery,
+    );
     const domainMoney = Money.from(command.money);
     if (!domainMoney.isPositive()) {
       throw new InvalidWagerCommandError('money amount must be positive');
@@ -116,6 +125,42 @@ export class ProcessWagerTransactionUseCase {
               command.referenceExternalTransactionId,
           }),
       correlationId: command.correlationId,
+      ...(delivery === undefined ? {} : { delivery }),
+    });
+  }
+
+  private static normalizeDelivery(
+    delivery: ProcessWagerTransactionCommand['delivery'],
+  ): NormalizedWagerTransactionCommand['delivery'] {
+    if (delivery === undefined) {
+      return undefined;
+    }
+
+    for (const [field, value] of [
+      ['consumerName', delivery.consumerName],
+      ['messageId', delivery.messageId],
+      ['payloadHash', delivery.payloadHash],
+    ] as const) {
+      if (typeof value !== 'string' || value.trim().length === 0) {
+        throw new InvalidWagerCommandError(
+          `delivery.${field} must be non-empty`,
+        );
+      }
+    }
+    if (
+      !(delivery.receivedAt instanceof Date) ||
+      Number.isNaN(delivery.receivedAt.getTime())
+    ) {
+      throw new InvalidWagerCommandError(
+        'delivery.receivedAt must be a valid timestamp',
+      );
+    }
+
+    return Object.freeze({
+      consumerName: delivery.consumerName,
+      messageId: delivery.messageId,
+      payloadHash: delivery.payloadHash,
+      receivedAt: new Date(delivery.receivedAt.getTime()),
     });
   }
 

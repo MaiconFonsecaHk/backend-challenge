@@ -22,6 +22,9 @@ test('parses and normalizes a valid application environment', () => {
     PORT: 3_000,
     POSTGRES_HOST: '127.0.0.1',
     POSTGRES_PORT: 5_432,
+    SQS_MAX_RECEIVE_COUNT: 5,
+    SQS_VISIBILITY_TIMEOUT_SECONDS: 30,
+    SQS_MAX_RETRY_VISIBILITY_SECONDS: 300,
   });
 });
 
@@ -29,6 +32,16 @@ test('rejects incomplete static AWS credentials', () => {
   const result = environmentSchema.safeParse({
     ...validEnvironment,
     AWS_ACCESS_KEY_ID: 'test',
+  });
+
+  expect(result.success).toBeFalse();
+});
+
+test('rejects a retry visibility cap below the base visibility timeout', () => {
+  const result = environmentSchema.safeParse({
+    ...validEnvironment,
+    SQS_VISIBILITY_TIMEOUT_SECONDS: '30',
+    SQS_MAX_RETRY_VISIBILITY_SECONDS: '10',
   });
 
   expect(result.success).toBeFalse();

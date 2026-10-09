@@ -147,6 +147,53 @@ describe('ProcessWagerTransactionUseCase', () => {
     });
   });
 
+  test('preserves validated delivery metadata without adding it to the business hash', async () => {
+    const processor = new ProcessorDouble(processedResult());
+    const { useCase, digest } = createUseCase(processor);
+    const receivedAt = new Date('2026-10-08T20:00:00.000Z');
+
+    await useCase.execute(
+      command({
+        delivery: {
+          consumerName: 'wager-transactions-consumer',
+          messageId: 'message-501',
+          payloadHash: 'message-payload-hash',
+          receivedAt,
+        },
+      }),
+    );
+
+    expect(processor.commands[0]?.delivery).toEqual({
+      consumerName: 'wager-transactions-consumer',
+      messageId: 'message-501',
+      payloadHash: 'message-payload-hash',
+      receivedAt,
+    });
+    expect(processor.commands[0]?.delivery?.receivedAt).not.toBe(receivedAt);
+    expect(digest.canonicalPayloads[0]).not.toContain('message-501');
+  });
+
+  test.each([
+    { consumerName: '', messageId: 'message', payloadHash: 'hash' },
+    { consumerName: 'consumer', messageId: ' ', payloadHash: 'hash' },
+    { consumerName: 'consumer', messageId: 'message', payloadHash: '' },
+  ])('rejects invalid delivery identity %o', async (delivery) => {
+    const processor = new ProcessorDouble(processedResult());
+    const { useCase } = createUseCase(processor);
+
+    await expect(
+      useCase.execute(
+        command({
+          delivery: {
+            ...delivery,
+            receivedAt: new Date('2026-10-08T20:00:00.000Z'),
+          },
+        }),
+      ),
+    ).rejects.toBeInstanceOf(InvalidWagerCommandError);
+    expect(processor.commands).toEqual([]);
+  });
+
   test.each([
     'providerId',
     'externalTransactionId',

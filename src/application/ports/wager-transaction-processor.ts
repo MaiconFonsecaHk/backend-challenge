@@ -18,6 +18,13 @@ export type ExternalWagerTransactionKind = Exclude<
   WagerTransactionKind.Opening
 >;
 
+export interface WagerMessageDelivery {
+  readonly consumerName: string;
+  readonly messageId: string;
+  readonly payloadHash: string;
+  readonly receivedAt: Date;
+}
+
 export interface NormalizedWagerTransactionCommand {
   readonly providerId: string;
   readonly externalTransactionId: string;
@@ -30,6 +37,7 @@ export interface NormalizedWagerTransactionCommand {
   readonly money: MoneyProps;
   readonly referenceExternalTransactionId?: string;
   readonly correlationId: string;
+  readonly delivery?: WagerMessageDelivery;
 }
 
 export interface WagerTransactionProcessingCommand

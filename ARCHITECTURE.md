@@ -46,13 +46,17 @@ AppModule
 │   ├── Base64UrlLedgerCursorCodec
 │   ├── UuidGenerator
 │   └── SystemClock
+├── SqsWagerConsumerModule
+│   ├── SqsWagerConsumer ── long polling, ack, retry e DLQ
+│   ├── SqsWagerMessageHandler ── contrato SQS → use case compartilhado
+│   └── ProcessWagerTransactionUseCase ── inbox + efeitos + outbox atômicos
 └── HealthModule
     ├── GET /health/live
     ├── PostgreSQL health indicator ── MikroORM ── SELECT 1
     └── SQS health indicator ── AWS SDK v3 ── MiniStack/SQS
 ```
 
-Os endpoints financeiros e de consulta já expõem os casos de uso por uma borda HTTP validada; consumidor SQS e workers ainda não existem. O domínio puro da Fase 2 contém `Money`, `Wallet`, `WagerTransaction`, `WalletLedgerEntry`, os modelos de inbox/outbox e os eventos de integração. A infraestrutura materializa os cinco modelos persistentes com constraints, índices, mappers, repositórios e Unit of Work transacional. A aplicação possui os casos de uso de criação, consulta e reconciliação de wallet, consulta paginada do ledger e uma entrada única e independente de transporte para submissões de wagering. Essa entrada normaliza o comando, calcula seu hash canônico e passa por um processador de idempotência persistente que serializa operações de saldo por wallet e executa todas as regras financeiras com seus efeitos atômicos.
+Os endpoints financeiros e de consulta e o consumidor SQS expõem o mesmo caso de uso de wagering por bordas validadas; publisher da outbox e worker de referências ainda não existem. O domínio puro da Fase 2 contém `Money`, `Wallet`, `WagerTransaction`, `WalletLedgerEntry`, os modelos de inbox/outbox e os eventos de integração. A infraestrutura materializa os cinco modelos persistentes com constraints, índices, mappers, repositórios e Unit of Work transacional. A aplicação possui os casos de uso de criação, consulta e reconciliação de wallet, consulta paginada do ledger e uma entrada única e independente de transporte para submissões de wagering. Essa entrada normaliza o comando, calcula seu hash canônico e passa por um processador de idempotência persistente que serializa operações de saldo por wallet e executa inbox e efeitos financeiros com outbox na mesma transação SQL.
 
 ## 4. Boundaries e dependências
 
@@ -366,10 +370,32 @@ O baseline permanece neutro e prova a cadeia inicial. A migration seguinte cont�
 - **Alternativas consideradas:** integrar Keycloak ou Zitadel agora foi adiado porque autenticação não pontua e exigiria provisionamento, ciclo de token e testes operacionais adicionais; criar tabela local de usuários e senhas foi rejeitado explicitamente; deixar controllers sem qualquer fronteira foi rejeitado porque tornaria a integração futura difusa; um guard global foi rejeitado porque poderia capturar health por engano.
 - **Escolha:** `DeferredProviderAuthenticationGuard` é aplicado somente aos três controllers financeiros e atualmente permite a requisição sem inspecionar credenciais. Ele é provider do módulo HTTP e constitui o ponto único a ser substituído pela validação de um Identity Provider externo. `HealthController` não possui esse guard.
 - **Fluxo futuro:** o guard validará assinatura, issuer, audience e expiração do bearer token usando metadata/JWKS do IdP; extrairá `sub`, escopos e uma claim de provider; comparará a identidade autorizada com `providerId` presente em rota ou payload antes do caso de uso; e anexará uma identidade imutável ao request para autorização e correlação. Endpoints de wallet exigirão uma claim/escopo que autorize a operação sobre o player ou wallet sem criar uma base local de credenciais.
-- **SQS:** o consumer será um canal interno autenticado pela infraestrutura AWS, mas ainda validará a identidade de provider contida na mensagem e reutilizará as mesmas regras de aplicação. Credenciais de infraestrutura não substituem validação do conteúdo.
+- **SQS:** o consumer é um canal interno autenticado pela infraestrutura AWS, valida estritamente a forma da identidade de provider contida na mensagem e reutiliza as mesmas regras de aplicação. A autorização do provider contra uma identidade confiável continua necessária antes de exposição externa; credenciais de infraestrutura não substituem essa associação.
 - **Trade-off:** a API financeira permanece aberta no estado atual, o que é uma limitação consciente e documentada. Em troca, o código deixa claro onde a autenticação entra, health permanece público por construção e nenhuma solução de identidade parcial ou insegura compete com os requisitos obrigatórios.
 - **Evidência:** testes de metadata confirmam que todos os controllers financeiros carregam o guard substituível, que o guard adiado permite a execução atual e que `HealthController` não está dentro dessa fronteira.
 - **Limitação e gatilho de revisão:** antes de qualquer exposição fora do ambiente controlado, o guard permissivo deverá ser substituído pela integração real do IdP e por testes de token inválido, claim divergente, escopo insuficiente e rotação de chave.
+
+### D-030 — Inbox e efeitos SQS compartilham uma única transação SQL
+
+- **Status:** confirmada para consumo de wagering e redelivery.
+- **Requisito protegido:** uma mensagem confirmada não pode perder seu efeito financeiro, e a mesma entrega não pode produzir dois efeitos mesmo se o worker morrer depois do commit e antes do ack.
+- **Alternativas consideradas:** confiar na deduplicação FIFO foi rejeitado porque sua janela não representa a vida da operação e não protege reentregas após falhas; persistir a inbox antes ou depois do caso de uso foi rejeitado porque criaria respectivamente perda de efeito ou duplicidade; criar um caso de uso específico para SQS foi rejeitado porque permitiria divergência em relação ao HTTP; deduplicação em memória foi rejeitada por não sobreviver a reinício nem coordenar instâncias.
+- **Escolha:** o adapter valida um envelope fechado, exige `MessageGroupId` igual ao `walletId`, usa o `messageId` do corpo como correlação e calcula SHA-256 sobre o JSON canônico completo. O `ProcessWagerTransactionUseCase` recebe esse contexto de entrega e o processador cria ou conclui `(consumerName, messageId)` dentro do mesmo Unit of Work que wallet, ledger, transação e outbox. Redelivery com o mesmo hash recupera o resultado persistido; o mesmo identificador com corpo diferente gera `INBOX_PAYLOAD_CONFLICT`. O consumer executa `DeleteMessage` somente depois que o caso de uso retorna, portanto depois do commit.
+- **Concorrência e FIFO:** mensagens do mesmo grupo são executadas sequencialmente dentro do lote, enquanto grupos de wallets diferentes avançam em paralelo. Essa ordenação reduz contenção, mas não é autoridade de consistência: locks por wallet, constraints, idempotência financeira e inbox no PostgreSQL continuam válidos com consumidores e instâncias concorrentes.
+- **Trade-off:** o hash do envelope completo faz mudanças em metadados observáveis serem tratadas como conflito, uma escolha conservadora que impede reinterpretar uma identidade já processada. A inbox duplica parte da proteção da chave de idempotência, mas identifica a entrega do broker independentemente da operação do provedor e fecha a janela commit/ack.
+- **Evidência:** testes unitários cobrem contrato, grupo FIFO, hash, criação/conclusão da inbox, replay, conflito de payload e recuperação de corrida por unicidade. No PostgreSQL real, a inbox é confirmada com wallet, ledger, transação e duas mensagens de outbox; uma reentrega mantém exatamente uma linha de cada efeito e devolve replay; uma falha de flush reverte também a inbox. No SQS real em container, uma falha simulada do ack força redelivery e a segunda execução é confirmada sem perda.
+- **Limitação e gatilho de revisão:** a identidade do provider ainda não é autorizada contra um IdP. A prova local usa MiniStack e não substitui testes operacionais periódicos na AWS real.
+
+### D-031 — Falhas SQS têm destinos finitos e shutdown drena trabalho iniciado
+
+- **Status:** confirmada para o consumer de wagering.
+- **Requisito protegido:** falhas transitórias precisam recuperar sem loop imediato ou infinito; mensagens inválidas precisam sair do fluxo principal; shutdown não pode confirmar trabalho incompleto nem abandonar silenciosamente um lote iniciado.
+- **Alternativas consideradas:** retry imediato foi rejeitado por amplificar indisponibilidade; retry ilimitado foi rejeitado por bloquear o grupo FIFO; reenviar toda falha manualmente à fila principal foi rejeitado por alterar identidade e ordem; enviar resultados financeiros rejeitados à DLQ foi rejeitado porque rejeição de negócio é um resultado persistido com sucesso; interromper o processo sem aguardar o lote foi rejeitado porque ampliaria a janela de redelivery evitável.
+- **Escolha:** resultados processados, rejeitados ou pendentes retornam normalmente e são confirmados. Falhas transitórias conhecidas de conexão, deadlock, lock timeout e rede alteram a visibilidade com backoff exponencial. Falhas permanentes de contrato ou conteúdo são copiadas para a DLQ e só então removidas da fila principal. Ao atingir `SQS_MAX_RECEIVE_COUNT`, a mensagem transitória permanece sem ack para a redrive policy nativa. Em shutdown, o long poll atual é abortado e o consumer aguarda o lote já recebido; se uma operação de broker falhar, a mensagem permanece não confirmada e volta a ficar visível.
+- **Limites e justificativa:** a configuração padrão usa visibilidade base de 30 segundos, teto de 300 segundos e cinco recebimentos. Isso produz oportunidades delimitadas de 30, 60, 120 e 240 segundos antes de a quinta falha seguir para redrive, evitando tanto loop apertado quanto espera ilimitada. Os valores são externos e devem ser revistos a partir de p99 de processamento, lock wait e tempo de recuperação observados; o teto nunca pode ser menor que a base.
+- **Trade-off:** a cópia explícita de falhas permanentes para a DLQ dá destino imediato e auditável, mas exige que o envio à DLQ seja bem-sucedido antes do ack; uma falha nesse envio deixa a origem para nova tentativa. A redrive nativa de transitórios preserva o receive count do broker, mas o instante exato pode variar entre o emulador e a AWS.
+- **Evidência:** testes unitários provam ack posterior ao handler, paralelismo entre grupos, ordem dentro do grupo, backoff, exaustão sem ack, envio à DLQ antes da remoção e validação dos limites. Testes com SQS real em container comprovam redelivery após falha de ack, DLQ imediata para falha permanente e redrive nativa após duas tentativas transitórias em filas isoladas de teste. O script de bootstrap cria fila FIFO, DLQ FIFO e redrive policy reproduzível.
+- **Limitação e gatilho de revisão:** logs estruturados e métricas de retry/DLQ pertencem à Fase 9. O shutdown cooperativo não elimina redelivery em `SIGKILL`, perda do host ou expiração de visibilidade; a inbox torna essas reentregas seguras.
 
 ## 6. Decisões abertas
 
@@ -378,13 +404,9 @@ Nenhuma alternativa desta tabela está escolhida antecipadamente.
 | Decisão | Requisito protegido | Alternativas que precisam ser avaliadas | Evidência necessária para fechar |
 | --- | --- | --- | --- |
 | Limite transacional dos casos de uso | atomicidade de wallet, ledger, transação, inbox e outbox | composição de cada operação financeira dentro do Unit of Work já comprovado | testes de falha antes/depois do commit e concorrência para cada caso de uso |
-| Inbox SQS | deduplicação persistente e ack após commit | modelo de inbox e fronteira transacional do consumer | redelivery, crash após commit e antes do ack, múltiplos consumers |
 | Outbox | nenhum evento confirmado perdido | claim concorrente, leasing/locking e marcação de publicação | crash após commit, dois publishers e publicação duplicada |
-| Ordenação FIFO | preservar paralelismo por wallet sem torná-lo garantia final | `MessageGroupId` por wallet e deduplicação do broker como otimização | mesma wallet serializada, wallets distintas paralelas e redelivery |
-| Retry e backoff | recuperação sem loop infinito | limites, backoff e classificação de erros ainda não definidos | testes de erro transitório, permanente, exaustão e observabilidade |
 | Referência pendente | processar mensagens fora de ordem sem perda | TTL ou máximo de tentativas ainda não definidos | referência posterior, expiração e rejeição terminal auditável |
-| Taxonomia de erros do consumer | workers agirem sem analisar texto | reutilizar as categorias de D-028 sem transportar conceitos de status HTTP para SQS | testes de ack, retry e DLQ por categoria estável |
-| Shutdown de workers | não perder trabalho em andamento | drenagem, extensão/devolução de visibility timeout e ordem de encerramento | `SIGTERM` durante consumo e publicação |
+| Shutdown do publisher e worker de referências | não perder trabalho em andamento | drenagem, extensão/devolução de leases e ordem de encerramento | `SIGTERM` durante publicação e recuperação de referências |
 | Observabilidade | diagnosticar rejeições, retries, DLQ e divergências | formato de logs, correlação e métricas ainda não definidos | testes que confirmem sinais úteis sem expor dados sensíveis |
 
 ## 7. Modelo transacional — estado atual
@@ -417,20 +439,21 @@ bun run typecheck
 bun run build
 bun run test
 bun run test:integration:postgres
+bun run test:integration:sqs
 bun run migration:pending
 bun run migration:up
 bun run migration:down
 ```
 
-O ciclo `up → inspeção → down → inspeção → up` agora é automatizado em um banco temporário criado por execução. A suíte PostgreSQL também comprova round-trip exato dos cinco modelos, commit, rollback após SQL efetivamente executado, constraints representativas, imutabilidade do ledger, paginação estável com empate de timestamp e inserção entre páginas e reconciliação sem correção silenciosa. A inspeção inicial permanece como evidência ampliada de 22 violações e dos planos dos três índices com dados representativos. Os testes de concorrência financeira e de SQS serão adicionados nas fases correspondentes; a suíte atual também comprova o runner do Bun, a configuração, o comportamento puro do domínio e os contratos de persistência.
+O ciclo `up → inspeção → down → inspeção → up` é automatizado em um banco temporário criado por execução. A suíte PostgreSQL comprova round-trip exato dos cinco modelos, commit e rollback incluindo inbox, constraints representativas, imutabilidade do ledger, paginação estável, reconciliação, disputa financeira real e cinquenta submissões concorrentes. A suíte SQS cria filas temporárias no emulador real e comprova redelivery após falha de ack, DLQ permanente e redrive transitória. A suíte normal também comprova o runner do Bun, configuração, domínio, contratos, agrupamento concorrente e decisões de retry sem substituir essas provas de infraestrutura.
 
 ## 10. Limitações atuais
 
 - endpoints de wallet, ledger, reconciliação e wagering estão implementados com contratos estritos e taxonomia HTTP estável;
-- não existem consumer SQS, publisher da outbox ou workers de referência pendente;
-- inbox e outbox possuem domínio e persistência, mas ainda não possuem os mecanismos operacionais da mensageria;
-- concorrência por wallet e idempotência HTTP estão implementadas; a deduplicação atômica do consumer ainda não;
-- não existem testes automatizados de integração com SQS, concorrência ou crash recovery;
+- o consumer SQS e a inbox atômica estão implementados; publisher da outbox e worker de referências pendentes ainda não existem;
+- outbox possui domínio e persistência transacional, mas ainda não possui publicação, claim concorrente ou recuperação operacional;
+- concorrência por wallet, idempotência HTTP e deduplicação SQS estão implementadas; a autorização da identidade do provider ainda não;
+- existem testes reais de PostgreSQL, SQS, concorrência financeira e redelivery commit/ack; crash abrupto de processo e três processos completos permanecem na Fase 10;
 - não existem autenticação, logs estruturados ou métricas de negócio;
 - o comportamento do emulador local não substitui validação operacional em AWS real.
 

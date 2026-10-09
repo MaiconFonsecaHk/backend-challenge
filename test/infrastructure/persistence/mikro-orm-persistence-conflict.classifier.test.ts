@@ -30,4 +30,20 @@ describe('MikroOrmPersistenceConflictClassifier', () => {
       classifier.isWagerIdempotencyKeyConflict(new Error('not a DB conflict')),
     ).toBe(false);
   });
+
+  test('matches only the inbox composite primary-key constraint', () => {
+    expect(
+      classifier.isInboxIdentityConflict(
+        uniqueViolation('inbox_messages_pkey'),
+      ),
+    ).toBe(true);
+    expect(
+      classifier.isInboxIdentityConflict(
+        uniqueViolation('wager_transactions_idempotency_key_unique'),
+      ),
+    ).toBe(false);
+    expect(
+      classifier.isInboxIdentityConflict(new Error('not a DB conflict')),
+    ).toBe(false);
+  });
 });

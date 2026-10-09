@@ -33,3 +33,11 @@ export class WagerTransactionNotFoundError extends ApplicationError {
     super('Wager transaction was not found.');
   }
 }
+
+export class InboxPayloadConflictError extends ApplicationError {
+  readonly code = 'INBOX_PAYLOAD_CONFLICT';
+
+  constructor() {
+    super('The message identity was already used with a different payload.');
+  }
+}

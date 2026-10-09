@@ -2,7 +2,10 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { Migrator } from '@mikro-orm/migrations';
 import { MikroORM } from '@mikro-orm/postgresql';
 
-import { IdempotencyConflictError } from '../../../src/application/errors/wager-application.error.js';
+import {
+  IdempotencyConflictError,
+  InboxPayloadConflictError,
+} from '../../../src/application/errors/wager-application.error.js';
 import type { Clock } from '../../../src/application/ports/clock.js';
 import type { IdGenerator } from '../../../src/application/ports/id-generator.js';
 import type {
@@ -1157,6 +1160,12 @@ describePostgreSql('PostgreSQL schema integration', () => {
         kind: WagerTransactionKind.Bet,
         money: { amount: '25.00', currency: 'BRL' },
         correlationId: 'correlation-bet-114',
+        delivery: {
+          consumerName: 'wager-transactions-consumer',
+          messageId: 'message-114',
+          payloadHash: 'sqs-payload-114',
+          receivedAt: CREATED_AT,
+        },
       });
     } catch (error) {
       caught = error;
@@ -1180,6 +1189,117 @@ describePostgreSql('PostgreSQL schema integration', () => {
         ),
       ).toBeUndefined();
       expect((await repositories.wallets.findById(walletId))?.version).toBe(1);
+      expect(
+        await repositories.inboxMessages.findByIdentity(
+          'wager-transactions-consumer',
+          'message-114',
+        ),
+      ).toBeUndefined();
+    });
+  });
+
+  test('commits inbox with financial effects and deduplicates SQS redelivery', async () => {
+    const walletId = '10000000-0000-4000-8000-000000000115';
+    const playerId = '20000000-0000-4000-8000-000000000115';
+    const unitOfWork = new MikroOrmUnitOfWork(requiredApplicationOrm());
+    await new CreateWalletUseCase(
+      unitOfWork,
+      new SequenceIdGenerator([
+        walletId,
+        '30000000-0000-4000-8000-000000000115',
+        '40000000-0000-4000-8000-000000000115',
+        '50000000-0000-4000-8000-000000000115',
+      ]),
+      new FixedClock(CREATED_AT),
+    ).execute({
+      playerId,
+      initialBalance: { amount: '100.00', currency: 'BRL' },
+      correlationId: 'wallet-create-integration-115',
+    });
+    const useCase = createFinancialUseCase(requiredApplicationOrm());
+    const submission = {
+      providerId: 'provider-inbox',
+      externalTransactionId: 'bet-115',
+      idempotencyKey: 'provider-inbox:bet-115',
+      playerId,
+      walletId,
+      roundId: 'round-inbox-115',
+      gameId: 'game-inbox-115',
+      kind: WagerTransactionKind.Bet,
+      money: { amount: '25.00', currency: 'BRL' },
+      correlationId: 'message-115',
+      delivery: {
+        consumerName: 'wager-transactions-consumer',
+        messageId: 'message-115',
+        payloadHash: 'sqs-payload-115',
+        receivedAt: CREATED_AT,
+      },
+    } as const;
+
+    const first = await useCase.execute(submission);
+    const replay = await useCase.execute(submission);
+
+    expect(first).toMatchObject({
+      status: WagerTransactionStatus.Processed,
+      balance: { amount: '75.00', currency: 'BRL' },
+      idempotentReplay: false,
+    });
+    expect(replay).toEqual({ ...first, idempotentReplay: true });
+    await expect(
+      useCase.execute({
+        ...submission,
+        delivery: {
+          ...submission.delivery,
+          payloadHash: 'different-sqs-payload-115',
+        },
+      }),
+    ).rejects.toBeInstanceOf(InboxPayloadConflictError);
+
+    const [counts] = await requiredApplicationOrm().em
+      .getConnection()
+      .execute<
+        Array<{
+          inbox_count: string;
+          ledger_count: string;
+          outbox_count: string;
+          transaction_count: string;
+        }>
+      >(
+        `select
+           (select count(*)::text from inbox_messages where consumer_name = ? and message_id = ?) as inbox_count,
+           (select count(*)::text from wallet_ledger_entries where wallet_id = ? and transaction_id = ?) as ledger_count,
+           (select count(*)::text from outbox_messages where payload -> 'data' ->> 'transactionId' = ?) as outbox_count,
+           (select count(*)::text from wager_transactions where idempotency_key = ?) as transaction_count`,
+        [
+          submission.delivery.consumerName,
+          submission.delivery.messageId,
+          walletId,
+          first.transactionId,
+          first.transactionId,
+          submission.idempotencyKey,
+        ],
+      );
+    expect(counts).toEqual({
+      inbox_count: '1',
+      ledger_count: '1',
+      outbox_count: '2',
+      transaction_count: '1',
+    });
+    await unitOfWork.execute(async (repositories) => {
+      const inbox = await repositories.inboxMessages.findByIdentity(
+        submission.delivery.consumerName,
+        submission.delivery.messageId,
+      );
+      expect(inbox?.isProcessed()).toBe(true);
+      expect(inbox?.processedAt?.toISOString()).toBe(CREATED_AT.toISOString());
+    });
+    expect(await new ReconcileWalletUseCase(unitOfWork).execute(walletId)).toEqual({
+      walletId,
+      storedBalance: { amount: '75.00', currency: 'BRL' },
+      calculatedBalance: { amount: '75.00', currency: 'BRL' },
+      difference: { amount: '0.00', currency: 'BRL' },
+      consistent: true,
+      checkedEntries: 2,
     });
   });
 

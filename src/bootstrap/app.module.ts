@@ -5,6 +5,7 @@ import { environmentSchema } from '../config/environment.schema.js';
 import { PersistenceModule } from '../infrastructure/persistence/persistence.module.js';
 import { HealthModule } from '../interfaces/health/health.module.js';
 import { HttpApiModule } from './http-api.module.js';
+import { SqsWagerConsumerModule } from './sqs-wager-consumer.module.js';
 
 @Module({
   imports: [
@@ -16,6 +17,7 @@ import { HttpApiModule } from './http-api.module.js';
     }),
     PersistenceModule,
     HttpApiModule,
+    SqsWagerConsumerModule,
     HealthModule,
   ],
 })
