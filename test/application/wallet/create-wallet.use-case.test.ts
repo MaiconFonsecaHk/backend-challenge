@@ -4,6 +4,7 @@ import type { Clock } from '../../../src/application/ports/clock.js';
 import type { IdGenerator } from '../../../src/application/ports/id-generator.js';
 import type { PersistenceRepositories } from '../../../src/application/ports/persistence/repositories.js';
 import type { UnitOfWork } from '../../../src/application/ports/persistence/unit-of-work.js';
+import type { WalletPersistenceConflictClassifier } from '../../../src/application/ports/persistence/wallet-persistence-conflict-classifier.js';
 import {
   InvalidCorrelationIdError,
   WalletAlreadyExistsError,
@@ -30,6 +31,16 @@ const IDS = {
 class FixedClock implements Clock {
   now(): Date {
     return new Date(NOW.getTime());
+  }
+}
+
+class WalletConflictClassifierDouble
+  implements WalletPersistenceConflictClassifier
+{
+  constructor(private readonly matchingError?: unknown) {}
+
+  isWalletIdentityConflict(error: unknown): boolean {
+    return error === this.matchingError;
   }
 }
 
@@ -134,6 +145,7 @@ describe('CreateWalletUseCase', () => {
       unitOfWork,
       idGenerator,
       new FixedClock(),
+      new WalletConflictClassifierDouble(),
     );
 
     const result = await useCase.execute({
@@ -181,6 +193,7 @@ describe('CreateWalletUseCase', () => {
       unitOfWork,
       idGenerator,
       new FixedClock(),
+      new WalletConflictClassifierDouble(),
     );
 
     const result = await useCase.execute({
@@ -210,6 +223,7 @@ describe('CreateWalletUseCase', () => {
       unitOfWork,
       idGenerator,
       new FixedClock(),
+      new WalletConflictClassifierDouble(),
     );
 
     await expect(
@@ -239,6 +253,7 @@ describe('CreateWalletUseCase', () => {
       guardedUnitOfWork,
       new SequenceIdGenerator(Object.values(IDS)),
       new FixedClock(),
+      new WalletConflictClassifierDouble(),
     );
 
     await expect(
@@ -249,5 +264,57 @@ describe('CreateWalletUseCase', () => {
       }),
     ).rejects.toBeInstanceOf(InvalidCorrelationIdError);
     expect(unitOfWorkCalls).toBe(0);
+  });
+
+  test('translates only a classified concurrent wallet identity conflict', async () => {
+    const persistenceError = new Error('wallet identity constraint');
+    const unitOfWork: UnitOfWork = {
+      execute: async () => {
+        throw persistenceError;
+      },
+    };
+    const useCase = new CreateWalletUseCase(
+      unitOfWork,
+      new SequenceIdGenerator([]),
+      new FixedClock(),
+      new WalletConflictClassifierDouble(persistenceError),
+    );
+
+    await expect(
+      useCase.execute({
+        playerId: '20000000-0000-4000-8000-000000000202',
+        initialBalance: { amount: '0.00', currency: 'BRL' },
+        correlationId: 'request-concurrent-duplicate',
+      }),
+    ).rejects.toEqual(
+      expect.objectContaining({
+        code: 'WALLET_ALREADY_EXISTS',
+        playerId: '20000000-0000-4000-8000-000000000202',
+        currency: 'BRL',
+      }),
+    );
+  });
+
+  test('preserves an unclassified persistence failure', async () => {
+    const persistenceError = new Error('unexpected persistence failure');
+    const unitOfWork: UnitOfWork = {
+      execute: async () => {
+        throw persistenceError;
+      },
+    };
+    const useCase = new CreateWalletUseCase(
+      unitOfWork,
+      new SequenceIdGenerator([]),
+      new FixedClock(),
+      new WalletConflictClassifierDouble(),
+    );
+
+    await expect(
+      useCase.execute({
+        playerId: '20000000-0000-4000-8000-000000000203',
+        initialBalance: { amount: '0.00', currency: 'BRL' },
+        correlationId: 'request-unexpected-failure',
+      }),
+    ).rejects.toBe(persistenceError);
   });
 });

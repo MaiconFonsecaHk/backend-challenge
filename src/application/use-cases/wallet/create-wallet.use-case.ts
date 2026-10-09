@@ -2,6 +2,7 @@ import type { Clock } from '../../ports/clock.js';
 import type { IdGenerator } from '../../ports/id-generator.js';
 import type { PersistenceRepositories } from '../../ports/persistence/repositories.js';
 import type { UnitOfWork } from '../../ports/persistence/unit-of-work.js';
+import type { WalletPersistenceConflictClassifier } from '../../ports/persistence/wallet-persistence-conflict-classifier.js';
 import {
   InvalidCorrelationIdError,
   WalletAlreadyExistsError,
@@ -41,6 +42,7 @@ export class CreateWalletUseCase {
     private readonly unitOfWork: UnitOfWork,
     private readonly idGenerator: IdGenerator,
     private readonly clock: Clock,
+    private readonly conflictClassifier: WalletPersistenceConflictClassifier,
   ) {}
 
   async execute(command: CreateWalletCommand): Promise<CreateWalletResult> {
@@ -50,45 +52,57 @@ export class CreateWalletUseCase {
 
     const initialBalance = Money.from(command.initialBalance);
 
-    return this.unitOfWork.execute(async (repositories) => {
-      const existingWallet = await repositories.wallets.findByPlayerAndCurrency(
-        command.playerId,
-        initialBalance.currency,
-      );
+    try {
+      return await this.unitOfWork.execute(async (repositories) => {
+        const existingWallet =
+          await repositories.wallets.findByPlayerAndCurrency(
+            command.playerId,
+            initialBalance.currency,
+          );
 
-      if (existingWallet !== undefined) {
+        if (existingWallet !== undefined) {
+          throw new WalletAlreadyExistsError(
+            command.playerId,
+            initialBalance.currency,
+          );
+        }
+
+        const occurredAt = this.clock.now();
+        const wallet = Wallet.open({
+          id: this.idGenerator.generate(),
+          playerId: command.playerId,
+          initialBalance,
+          openedAt: occurredAt,
+        });
+
+        if (initialBalance.isPositive()) {
+          await this.addOpeningRecords(
+            wallet,
+            command.correlationId,
+            occurredAt,
+            repositories,
+          );
+        } else {
+          await repositories.wallets.add(wallet);
+        }
+
+        return Object.freeze({
+          id: wallet.id,
+          playerId: wallet.playerId,
+          balance: wallet.balance.toJSON(),
+          version: wallet.version,
+        });
+      });
+    } catch (error) {
+      if (this.conflictClassifier.isWalletIdentityConflict(error)) {
         throw new WalletAlreadyExistsError(
           command.playerId,
           initialBalance.currency,
         );
       }
 
-      const occurredAt = this.clock.now();
-      const wallet = Wallet.open({
-        id: this.idGenerator.generate(),
-        playerId: command.playerId,
-        initialBalance,
-        openedAt: occurredAt,
-      });
-
-      if (initialBalance.isPositive()) {
-        await this.addOpeningRecords(
-          wallet,
-          command.correlationId,
-          occurredAt,
-          repositories,
-        );
-      } else {
-        await repositories.wallets.add(wallet);
-      }
-
-      return Object.freeze({
-        id: wallet.id,
-        playerId: wallet.playerId,
-        balance: wallet.balance.toJSON(),
-        version: wallet.version,
-      });
-    });
+      throw error;
+    }
   }
 
   private async addOpeningRecords(

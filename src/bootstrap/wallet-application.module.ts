@@ -14,6 +14,7 @@ import { GetWalletUseCase } from '../application/use-cases/wallet/get-wallet.use
 import { ReconcileWalletUseCase } from '../application/use-cases/wallet/reconcile-wallet.use-case.js';
 import { UuidGenerator } from '../infrastructure/identity/uuid-generator.js';
 import { PersistenceModule } from '../infrastructure/persistence/persistence.module.js';
+import { MikroOrmPersistenceConflictClassifier } from '../infrastructure/persistence/mikro-orm-persistence-conflict.classifier.js';
 import { Base64UrlLedgerCursorCodec } from '../infrastructure/serialization/base64url-ledger-cursor.codec.js';
 import { SystemClock } from '../infrastructure/time/system-clock.js';
 
@@ -25,12 +26,24 @@ import { SystemClock } from '../infrastructure/time/system-clock.js';
     { provide: LEDGER_CURSOR_CODEC, useClass: Base64UrlLedgerCursorCodec },
     {
       provide: CreateWalletUseCase,
-      inject: [PERSISTENCE_UNIT_OF_WORK, ID_GENERATOR, CLOCK],
+      inject: [
+        PERSISTENCE_UNIT_OF_WORK,
+        ID_GENERATOR,
+        CLOCK,
+        MikroOrmPersistenceConflictClassifier,
+      ],
       useFactory: (
         unitOfWork: UnitOfWork,
         idGenerator: IdGenerator,
         clock: Clock,
-      ) => new CreateWalletUseCase(unitOfWork, idGenerator, clock),
+        conflictClassifier: MikroOrmPersistenceConflictClassifier,
+      ) =>
+        new CreateWalletUseCase(
+          unitOfWork,
+          idGenerator,
+          clock,
+          conflictClassifier,
+        ),
     },
     {
       provide: GetWalletUseCase,

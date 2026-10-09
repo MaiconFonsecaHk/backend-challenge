@@ -14,8 +14,10 @@ import type {
 } from '../../../src/application/ports/outbox-event-transport.js';
 import type {
   PersistenceRepositories,
+  WalletRepository,
   WagerTransactionRecord,
 } from '../../../src/application/ports/persistence/repositories.js';
+import type { UnitOfWork } from '../../../src/application/ports/persistence/unit-of-work.js';
 import type {
   NewWagerTransactionExecutor,
   WagerTransactionProcessingCommand,
@@ -48,6 +50,7 @@ import {
   WagerTransactionStatus,
 } from '../../../src/domain/wagering/wager-transaction.js';
 import { Wallet } from '../../../src/domain/wallet/wallet.js';
+import { mapHttpError } from '../../../src/interfaces/http/http-error-mapper.js';
 import { PERSISTENCE_ENTITIES } from '../../../src/infrastructure/persistence/entities/persistence-entities.js';
 import { Sha256PayloadDigest } from '../../../src/infrastructure/cryptography/sha256-payload-digest.js';
 import { UuidGenerator } from '../../../src/infrastructure/identity/uuid-generator.js';
@@ -202,6 +205,35 @@ class PublicationBarrier {
   }
 }
 
+function synchronizeWalletLookup(
+  unitOfWork: UnitOfWork,
+  barrier: PublicationBarrier,
+): UnitOfWork {
+  return {
+    execute: <T>(work: (repositories: PersistenceRepositories) => Promise<T>) =>
+      unitOfWork.execute(async (repositories) => {
+        const walletRepository: WalletRepository = {
+          findById: (id) => repositories.wallets.findById(id),
+          findByIdForUpdate: (id) =>
+            repositories.wallets.findByIdForUpdate(id),
+          findByPlayerAndCurrency: async (playerId, currency) => {
+            const wallet =
+              await repositories.wallets.findByPlayerAndCurrency(
+                playerId,
+                currency,
+              );
+            await barrier.arrive();
+            return wallet;
+          },
+          add: (wallet) => repositories.wallets.add(wallet),
+          save: (wallet) => repositories.wallets.save(wallet),
+        };
+
+        return work({ ...repositories, wallets: walletRepository });
+      }),
+  };
+}
+
 class BarrierOutboxTransport implements OutboxEventTransport {
   private firstPublication = true;
 
@@ -284,6 +316,19 @@ async function createIndependentApplicationOrm(
 
 function money(amount: string): Money {
   return Money.from({ amount, currency: 'BRL' });
+}
+
+function createWalletUseCase(
+  unitOfWork: UnitOfWork,
+  idGenerator: IdGenerator,
+  clock: Clock,
+): CreateWalletUseCase {
+  return new CreateWalletUseCase(
+    unitOfWork,
+    idGenerator,
+    clock,
+    new MikroOrmPersistenceConflictClassifier(),
+  );
 }
 
 function createFinancialUseCase(
@@ -948,7 +993,7 @@ describePostgreSql('PostgreSQL schema integration', () => {
     const walletId = '10000000-0000-4000-8000-000000000931';
     const playerId = '20000000-0000-4000-8000-000000000931';
     const unitOfWork = new MikroOrmUnitOfWork(requiredApplicationOrm());
-    await new CreateWalletUseCase(
+    await createWalletUseCase(
       unitOfWork,
       new SequenceIdGenerator([
         walletId,
@@ -1099,7 +1144,7 @@ describePostgreSql('PostgreSQL schema integration', () => {
     const walletId = '10000000-0000-4000-8000-000000000932';
     const playerId = '20000000-0000-4000-8000-000000000932';
     const unitOfWork = new MikroOrmUnitOfWork(requiredApplicationOrm());
-    await new CreateWalletUseCase(
+    await createWalletUseCase(
       unitOfWork,
       new SequenceIdGenerator([walletId]),
       new FixedClock(CREATED_AT),
@@ -1218,7 +1263,7 @@ describePostgreSql('PostgreSQL schema integration', () => {
     const ledgerId = '40000000-0000-4000-8000-000000000105';
     const eventId = '50000000-0000-4000-8000-000000000105';
     const unitOfWork = new MikroOrmUnitOfWork(requiredApplicationOrm());
-    const useCase = new CreateWalletUseCase(
+    const useCase = createWalletUseCase(
       unitOfWork,
       new SequenceIdGenerator([walletId, openingId, ledgerId, eventId]),
       new FixedClock(CREATED_AT),
@@ -1287,6 +1332,86 @@ describePostgreSql('PostgreSQL schema integration', () => {
         [walletId],
       );
     expect(reconciliation?.reconciled).toBe(true);
+  });
+
+  test('returns one 409 conflict when two instances concurrently create the same wallet', async () => {
+    const playerId = '20000000-0000-4000-8000-000000000116';
+    const firstWalletId = '10000000-0000-4000-8000-000000000116';
+    const secondWalletId = '10000000-0000-4000-8000-000000000117';
+    const firstOrm = await createIndependentApplicationOrm([]);
+    const secondOrm = await createIndependentApplicationOrm([]);
+    const barrier = new PublicationBarrier(2);
+
+    try {
+      const firstUseCase = createWalletUseCase(
+        synchronizeWalletLookup(new MikroOrmUnitOfWork(firstOrm), barrier),
+        new SequenceIdGenerator([firstWalletId]),
+        new FixedClock(CREATED_AT),
+      );
+      const secondUseCase = createWalletUseCase(
+        synchronizeWalletLookup(new MikroOrmUnitOfWork(secondOrm), barrier),
+        new SequenceIdGenerator([secondWalletId]),
+        new FixedClock(CREATED_AT),
+      );
+      const command = {
+        playerId,
+        initialBalance: { amount: '0.00', currency: 'BRL' },
+        correlationId: 'wallet-concurrent-create-106',
+      } as const;
+
+      const results = await Promise.allSettled([
+        firstUseCase.execute(command),
+        secondUseCase.execute(command),
+      ]);
+      const fulfilled = results.filter((result) => result.status === 'fulfilled');
+      const rejected = results.filter((result) => result.status === 'rejected');
+
+      expect(fulfilled).toHaveLength(1);
+      expect(rejected).toHaveLength(1);
+      if (rejected[0]?.status !== 'rejected') {
+        throw new Error('Expected one concurrent wallet creation to fail');
+      }
+
+      expect(mapHttpError(rejected[0].reason)).toEqual(
+        expect.objectContaining({
+          status: 409,
+          body: expect.objectContaining({
+            statusCode: 409,
+            code: 'WALLET_ALREADY_EXISTS',
+          }),
+        }),
+      );
+
+      const persistedWallets = await requiredApplicationOrm().em
+        .getConnection()
+        .execute<Array<{ id: string }>>(
+          `select id
+             from wallets
+            where player_id = ? and currency = ?`,
+          [playerId, 'BRL'],
+        );
+      expect(persistedWallets).toHaveLength(1);
+      const persistedWallet = persistedWallets[0];
+      if (persistedWallet === undefined) {
+        throw new Error('Expected the winning wallet to be persisted');
+      }
+      expect([firstWalletId, secondWalletId]).toContain(persistedWallet.id);
+
+      const reconciliation = await new ReconcileWalletUseCase(
+        new MikroOrmUnitOfWork(requiredApplicationOrm()),
+      ).execute(persistedWallet.id);
+      expect(reconciliation).toEqual(
+        expect.objectContaining({
+          storedBalance: { amount: '0.00', currency: 'BRL' },
+          calculatedBalance: { amount: '0.00', currency: 'BRL' },
+          difference: { amount: '0.00', currency: 'BRL' },
+          checkedEntries: 0,
+          consistent: true,
+        }),
+      );
+    } finally {
+      await Promise.all([firstOrm.close(true), secondOrm.close(true)]);
+    }
   });
 
   test('queries wallets, paginates the ledger, and exposes divergence without correction', async () => {
@@ -1447,7 +1572,7 @@ describePostgreSql('PostgreSQL schema integration', () => {
     const walletId = '10000000-0000-4000-8000-000000000108';
     const playerId = '20000000-0000-4000-8000-000000000108';
     const unitOfWork = new MikroOrmUnitOfWork(requiredApplicationOrm());
-    const createWallet = new CreateWalletUseCase(
+    const createWallet = createWalletUseCase(
       unitOfWork,
       new SequenceIdGenerator([walletId]),
       new FixedClock(CREATED_AT),
@@ -1477,7 +1602,7 @@ describePostgreSql('PostgreSQL schema integration', () => {
     const secondWalletId = '10000000-0000-4000-8000-000000000111';
     const secondPlayerId = '20000000-0000-4000-8000-000000000111';
     const unitOfWork = new MikroOrmUnitOfWork(requiredApplicationOrm());
-    await new CreateWalletUseCase(
+    await createWalletUseCase(
       unitOfWork,
       new SequenceIdGenerator([firstWalletId]),
       new FixedClock(CREATED_AT),
@@ -1486,7 +1611,7 @@ describePostgreSql('PostgreSQL schema integration', () => {
       initialBalance: { amount: '0.00', currency: 'BRL' },
       correlationId: 'wallet-lock-integration-110',
     });
-    await new CreateWalletUseCase(
+    await createWalletUseCase(
       unitOfWork,
       new SequenceIdGenerator([secondWalletId]),
       new FixedClock(CREATED_AT),
@@ -1580,7 +1705,7 @@ describePostgreSql('PostgreSQL schema integration', () => {
     const walletId = '10000000-0000-4000-8000-000000000112';
     const playerId = '20000000-0000-4000-8000-000000000112';
     const unitOfWork = new MikroOrmUnitOfWork(requiredApplicationOrm());
-    await new CreateWalletUseCase(
+    await createWalletUseCase(
       unitOfWork,
       new SequenceIdGenerator([
         walletId,
@@ -1739,7 +1864,7 @@ describePostgreSql('PostgreSQL schema integration', () => {
     const walletId = '10000000-0000-4000-8000-000000000113';
     const playerId = '20000000-0000-4000-8000-000000000113';
     const unitOfWork = new MikroOrmUnitOfWork(requiredApplicationOrm());
-    await new CreateWalletUseCase(
+    await createWalletUseCase(
       unitOfWork,
       new SequenceIdGenerator([
         walletId,
@@ -1813,7 +1938,7 @@ describePostgreSql('PostgreSQL schema integration', () => {
     const walletId = '10000000-0000-4000-8000-000000000114';
     const playerId = '20000000-0000-4000-8000-000000000114';
     const unitOfWork = new MikroOrmUnitOfWork(requiredApplicationOrm());
-    await new CreateWalletUseCase(
+    await createWalletUseCase(
       unitOfWork,
       new SequenceIdGenerator([
         walletId,
@@ -1902,7 +2027,7 @@ describePostgreSql('PostgreSQL schema integration', () => {
     const walletId = '10000000-0000-4000-8000-000000000115';
     const playerId = '20000000-0000-4000-8000-000000000115';
     const unitOfWork = new MikroOrmUnitOfWork(requiredApplicationOrm());
-    await new CreateWalletUseCase(
+    await createWalletUseCase(
       unitOfWork,
       new SequenceIdGenerator([
         walletId,
@@ -2008,7 +2133,7 @@ describePostgreSql('PostgreSQL schema integration', () => {
     const playerId = '20000000-0000-4000-8000-000000000109';
     const idempotencyKey = 'provider-idempotency:external-109';
     const unitOfWork = new MikroOrmUnitOfWork(requiredApplicationOrm());
-    await new CreateWalletUseCase(
+    await createWalletUseCase(
       unitOfWork,
       new SequenceIdGenerator([walletId]),
       new FixedClock(CREATED_AT),
@@ -2111,7 +2236,7 @@ describePostgreSql('PostgreSQL schema integration', () => {
     const ledgerId = '40000000-0000-4000-8000-000000000106';
     const eventId = '50000000-0000-4000-8000-000000000106';
     const unitOfWork = new MikroOrmUnitOfWork(requiredApplicationOrm());
-    const useCase = new CreateWalletUseCase(
+    const useCase = createWalletUseCase(
       unitOfWork,
       new SequenceIdGenerator([walletId, 'invalid-opening-id', ledgerId, eventId]),
       new FixedClock(CREATED_AT),

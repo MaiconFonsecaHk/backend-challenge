@@ -37,7 +37,6 @@ import { SystemClock } from '../infrastructure/time/system-clock.js';
     { provide: CLOCK, useClass: SystemClock },
     { provide: ID_GENERATOR, useClass: UuidGenerator },
     Sha256PayloadDigest,
-    MikroOrmPersistenceConflictClassifier,
     {
       provide: PendingReferenceRetryPolicy,
       inject: [ConfigService],

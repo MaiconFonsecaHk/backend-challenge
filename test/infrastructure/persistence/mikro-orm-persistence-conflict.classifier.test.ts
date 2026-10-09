@@ -19,6 +19,22 @@ function uniqueViolation(constraint: string): UniqueConstraintViolationException
 describe('MikroOrmPersistenceConflictClassifier', () => {
   const classifier = new MikroOrmPersistenceConflictClassifier();
 
+  test('matches only the wallet player-and-currency constraint', () => {
+    expect(
+      classifier.isWalletIdentityConflict(
+        uniqueViolation('wallets_player_id_currency_unique'),
+      ),
+    ).toBe(true);
+    expect(
+      classifier.isWalletIdentityConflict(
+        uniqueViolation('wager_transactions_idempotency_key_unique'),
+      ),
+    ).toBe(false);
+    expect(
+      classifier.isWalletIdentityConflict(new Error('not a DB conflict')),
+    ).toBe(false);
+  });
+
   test('matches only the wager idempotency-key constraint', () => {
     expect(
       classifier.isWagerIdempotencyKeyConflict(
