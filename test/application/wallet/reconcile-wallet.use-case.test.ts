@@ -58,6 +58,7 @@ function reconciliationContext(snapshot?: WalletReconciliationSnapshot): {
     },
     outboxMessages: {
       findById: async () => undefined,
+      getPendingSnapshot: async () => ({ pendingMessages: 0 }),
       findDueForUpdate: async () => [],
       add: unexpectedWrite,
       save: unexpectedWrite,

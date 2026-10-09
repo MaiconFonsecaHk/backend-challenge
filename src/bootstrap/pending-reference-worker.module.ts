@@ -7,6 +7,10 @@ import {
   OPERATIONAL_LOGGER,
   type OperationalLogger,
 } from '../application/ports/operational-logger.js';
+import {
+  OPERATIONAL_METRICS,
+  type OperationalMetrics,
+} from '../application/ports/operational-metrics.js';
 import type { UnitOfWork } from '../application/ports/persistence/unit-of-work.js';
 import { PERSISTENCE_UNIT_OF_WORK } from '../application/ports/persistence/unit-of-work.js';
 import { WagerTransactionExecutor } from '../application/services/wager-transaction.executor.js';
@@ -28,18 +32,21 @@ import { WageringApplicationModule } from './wagering-application.module.js';
         WagerTransactionExecutor,
         CLOCK,
         OPERATIONAL_LOGGER,
+        OPERATIONAL_METRICS,
       ],
       useFactory: (
         unitOfWork: UnitOfWork,
         executor: WagerTransactionExecutor,
         clock: Clock,
         logger: OperationalLogger,
+        metrics: OperationalMetrics,
       ) =>
         new ProcessPendingReferencesBatchUseCase(
           unitOfWork,
           executor,
           clock,
           logger,
+          metrics,
         ),
     },
     PendingReferenceWorker,

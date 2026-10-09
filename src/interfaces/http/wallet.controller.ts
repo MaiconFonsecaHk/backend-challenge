@@ -17,6 +17,11 @@ import {
   NOOP_OPERATIONAL_LOGGER,
   type OperationalLogger,
 } from '../../application/ports/operational-logger.js';
+import {
+  OPERATIONAL_METRICS,
+  NOOP_OPERATIONAL_METRICS,
+  type OperationalMetrics,
+} from '../../application/ports/operational-metrics.js';
 import { CreateWalletUseCase } from '../../application/use-cases/wallet/create-wallet.use-case.js';
 import { GetWalletLedgerUseCase } from '../../application/use-cases/wallet/get-wallet-ledger.use-case.js';
 import { GetWalletUseCase } from '../../application/use-cases/wallet/get-wallet.use-case.js';
@@ -40,6 +45,8 @@ export class WalletController {
     private readonly reconcileWallet: ReconcileWalletUseCase,
     @Inject(OPERATIONAL_LOGGER)
     private readonly logger: OperationalLogger = NOOP_OPERATIONAL_LOGGER,
+    @Inject(OPERATIONAL_METRICS)
+    private readonly metrics: OperationalMetrics = NOOP_OPERATIONAL_METRICS,
   ) {}
 
   @Post()
@@ -102,6 +109,7 @@ export class WalletController {
       this.logger.info('wallet.reconciled', context);
     } else {
       this.logger.warn('wallet.reconciliation.diverged', context);
+      this.metrics.recordReconciliationDivergence();
     }
     return result;
   }

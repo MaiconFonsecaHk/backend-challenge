@@ -1,10 +1,11 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, mock, test } from 'bun:test';
 
 import {
   IdempotencyConflictError,
   InboxPayloadConflictError,
 } from '../../../src/application/errors/wager-application.error.js';
 import type { PersistenceConflictClassifier } from '../../../src/application/ports/persistence/persistence-conflict-classifier.js';
+import type { OperationalMetrics } from '../../../src/application/ports/operational-metrics.js';
 import type {
   PersistenceRepositories,
   WagerTransactionRecord,
@@ -204,6 +205,7 @@ class ConflictClassifierDouble implements PersistenceConflictClassifier {
   constructor(
     private readonly matchingError: unknown,
     private readonly matchingInboxError?: unknown,
+    private readonly matchingLockError?: unknown,
   ) {}
 
   isWagerIdempotencyKeyConflict(error: unknown): boolean {
@@ -212,6 +214,10 @@ class ConflictClassifierDouble implements PersistenceConflictClassifier {
 
   isInboxIdentityConflict(error: unknown): boolean {
     return error === this.matchingInboxError;
+  }
+
+  isLockConflict(error: unknown): boolean {
+    return error === this.matchingLockError;
   }
 }
 
@@ -477,6 +483,23 @@ describe('PersistentWagerTransactionProcessor', () => {
     );
   });
 
+  test('counts a database lock conflict before propagating it', async () => {
+    const lockConflict = new Error('lock timeout');
+    const recordLockConflict = mock(() => undefined);
+    const processor = new PersistentWagerTransactionProcessor(
+      new UnitOfWorkDouble(
+        repositories(new WagerRepositoryDouble([undefined])),
+        [lockConflict],
+      ),
+      new ExecutorDouble(transactionRecord()),
+      new ConflictClassifierDouble(undefined, undefined, lockConflict),
+      operationalMetrics({ recordLockConflict }),
+    );
+
+    await expect(processor.process(command())).rejects.toBe(lockConflict);
+    expect(recordLockConflict).toHaveBeenCalledWith(WagerTransactionKind.Loss);
+  });
+
   test('rejects a new execution record that does not match its command', async () => {
     const processor = new PersistentWagerTransactionProcessor(
       new UnitOfWorkDouble(
@@ -491,3 +514,21 @@ describe('PersistentWagerTransactionProcessor', () => {
     );
   });
 });
+
+function operationalMetrics(overrides: Partial<OperationalMetrics>): OperationalMetrics {
+  return {
+    recordWagerOutcome: overrides.recordWagerOutcome ?? (() => undefined),
+    recordRetry: overrides.recordRetry ?? (() => undefined),
+    recordDeadLetterMessage:
+      overrides.recordDeadLetterMessage ?? (() => undefined),
+    recordLockConflict: overrides.recordLockConflict ?? (() => undefined),
+    recordReconciliationDivergence:
+      overrides.recordReconciliationDivergence ?? (() => undefined),
+    setOutboxState: overrides.setOutboxState ?? (() => undefined),
+    setReadiness: overrides.setReadiness ?? (() => undefined),
+    recordCollectionFailure:
+      overrides.recordCollectionFailure ?? (() => undefined),
+    contentType: () => 'text/plain',
+    render: async () => '',
+  };
+}

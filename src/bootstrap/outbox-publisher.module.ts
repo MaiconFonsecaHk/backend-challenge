@@ -8,6 +8,10 @@ import {
   type OperationalLogger,
 } from '../application/ports/operational-logger.js';
 import {
+  OPERATIONAL_METRICS,
+  type OperationalMetrics,
+} from '../application/ports/operational-metrics.js';
+import {
   OUTBOX_EVENT_TRANSPORT,
   type OutboxEventTransport,
 } from '../application/ports/outbox-event-transport.js';
@@ -47,6 +51,7 @@ import { OutboxPublisherWorker } from '../interfaces/workers/outbox-publisher.wo
         CLOCK,
         ExponentialOutboxRetryPolicy,
         OPERATIONAL_LOGGER,
+        OPERATIONAL_METRICS,
       ],
       useFactory: (
         unitOfWork: UnitOfWork,
@@ -54,6 +59,7 @@ import { OutboxPublisherWorker } from '../interfaces/workers/outbox-publisher.wo
         clock: Clock,
         retryPolicy: ExponentialOutboxRetryPolicy,
         logger: OperationalLogger,
+        metrics: OperationalMetrics,
       ) =>
         new PublishOutboxBatchUseCase(
           unitOfWork,
@@ -61,6 +67,7 @@ import { OutboxPublisherWorker } from '../interfaces/workers/outbox-publisher.wo
           clock,
           retryPolicy,
           logger,
+          metrics,
         ),
     },
     OutboxPublisherWorker,

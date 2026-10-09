@@ -8,6 +8,10 @@ import type {
   ProcessWagerTransactionResult,
   WagerTransactionProcessor,
 } from '../../ports/wager-transaction-processor.js';
+import {
+  NOOP_OPERATIONAL_METRICS,
+  type OperationalMetrics,
+} from '../../ports/operational-metrics.js';
 import { WagerPayloadFingerprintService } from '../../services/wager-payload-fingerprint.js';
 import {
   Money,
@@ -47,17 +51,27 @@ export class ProcessWagerTransactionUseCase {
   constructor(
     private readonly processor: WagerTransactionProcessor,
     private readonly payloadFingerprint: WagerPayloadFingerprintService,
+    private readonly metrics: OperationalMetrics = NOOP_OPERATIONAL_METRICS,
   ) {}
 
   async execute(
     command: ProcessWagerTransactionCommand,
   ): Promise<ProcessWagerTransactionResult> {
+    const startedAt = performance.now();
     const normalized = ProcessWagerTransactionUseCase.normalize(command);
     const processingCommand = Object.freeze({
       ...normalized,
       payloadHash: this.payloadFingerprint.fingerprint(normalized),
     });
     const result = await this.processor.process(processingCommand);
+
+    this.metrics.recordWagerOutcome({
+      source: normalized.delivery === undefined ? 'http' : 'sqs',
+      operation: normalized.kind,
+      status: result.status,
+      idempotentReplay: result.idempotentReplay,
+      durationSeconds: Math.max(0, (performance.now() - startedAt) / 1_000),
+    });
 
     return Object.freeze({
       transactionId: result.transactionId,

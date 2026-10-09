@@ -3,6 +3,10 @@ import {
   NOOP_OPERATIONAL_LOGGER,
   type OperationalLogger,
 } from '../../ports/operational-logger.js';
+import {
+  NOOP_OPERATIONAL_METRICS,
+  type OperationalMetrics,
+} from '../../ports/operational-metrics.js';
 import type { UnitOfWork } from '../../ports/persistence/unit-of-work.js';
 import { WagerTransactionExecutor } from '../../services/wager-transaction.executor.js';
 import { WagerTransactionStatus } from '../../../domain/wagering/wager-transaction.js';
@@ -20,6 +24,7 @@ export class ProcessPendingReferencesBatchUseCase {
     private readonly executor: WagerTransactionExecutor,
     private readonly clock: Clock,
     private readonly logger: OperationalLogger = NOOP_OPERATIONAL_LOGGER,
+    private readonly metrics: OperationalMetrics = NOOP_OPERATIONAL_METRICS,
   ) {}
 
   async execute(limit: number): Promise<ProcessPendingReferencesBatchResult> {
@@ -35,6 +40,7 @@ export class ProcessPendingReferencesBatchUseCase {
     let rescheduled = 0;
 
     for (let index = 0; index < limit; index += 1) {
+      const startedAt = performance.now();
       const outcome = await this.unitOfWork.execute(async (repositories) => {
         const record =
           await repositories.wagerTransactions.findNextPendingReferenceDueForUpdate(
@@ -83,9 +89,29 @@ export class ProcessPendingReferencesBatchUseCase {
       if (transaction.status === WagerTransactionStatus.Processed) {
         processed += 1;
         this.logger.info('pending_reference.processed', context);
+        this.metrics.recordWagerOutcome({
+          source: 'pending_reference_worker',
+          operation: transaction.kind,
+          status: transaction.status,
+          idempotentReplay: false,
+          durationSeconds: Math.max(
+            0,
+            (performance.now() - startedAt) / 1_000,
+          ),
+        });
       } else if (transaction.status === WagerTransactionStatus.Rejected) {
         rejected += 1;
         this.logger.warn('pending_reference.rejected', context);
+        this.metrics.recordWagerOutcome({
+          source: 'pending_reference_worker',
+          operation: transaction.kind,
+          status: transaction.status,
+          idempotentReplay: false,
+          durationSeconds: Math.max(
+            0,
+            (performance.now() - startedAt) / 1_000,
+          ),
+        });
       } else if (
         transaction.status === WagerTransactionStatus.PendingReference
       ) {
@@ -94,6 +120,7 @@ export class ProcessPendingReferencesBatchUseCase {
           ...context,
           retryable: true,
         });
+        this.metrics.recordRetry('pending_reference_worker');
       } else {
         throw new Error(
           `Unexpected pending-reference outcome: ${transaction.status}`,

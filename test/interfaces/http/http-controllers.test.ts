@@ -4,6 +4,7 @@ import type {
   OperationalLogContext,
   OperationalLogger,
 } from '../../../src/application/ports/operational-logger.js';
+import type { OperationalMetrics } from '../../../src/application/ports/operational-metrics.js';
 import type { CreateWalletUseCase } from '../../../src/application/use-cases/wallet/create-wallet.use-case.js';
 import type { GetWalletLedgerUseCase } from '../../../src/application/use-cases/wallet/get-wallet-ledger.use-case.js';
 import type { GetWalletUseCase } from '../../../src/application/use-cases/wallet/get-wallet.use-case.js';
@@ -88,6 +89,28 @@ describe('HTTP controllers', () => {
     expect(getExecute).toHaveBeenCalledWith(WALLET_ID);
     expect(ledgerExecute).toHaveBeenCalledWith({ walletId: WALLET_ID, limit: 50 });
     expect(reconcileExecute).toHaveBeenCalledWith(WALLET_ID);
+  });
+
+  test('counts a reconciliation divergence without using wallet identity as a metric label', async () => {
+    const recordReconciliationDivergence = mock(() => undefined);
+    const controller = walletController({
+      reconcileExecute: mock(async () => ({
+        walletId: WALLET_ID,
+        storedBalance: { amount: '11.00', currency: 'BRL' },
+        calculatedBalance: { amount: '10.00', currency: 'BRL' },
+        difference: { amount: '1.00', currency: 'BRL' },
+        consistent: false,
+        checkedEntries: 1,
+      })),
+      metrics: operationalMetrics({ recordReconciliationDivergence }),
+    });
+
+    await controller.reconcile(
+      { walletId: WALLET_ID },
+      'correlation-divergence',
+    );
+
+    expect(recordReconciliationDivergence).toHaveBeenCalledWith();
   });
 
   test('uses the Idempotency-Key header as the only transport source', async () => {
@@ -180,6 +203,7 @@ function walletController(options: {
   readonly getLedgerExecute?: ReturnType<typeof mock>;
   readonly reconcileExecute?: ReturnType<typeof mock>;
   readonly logger?: OperationalLogger;
+  readonly metrics?: OperationalMetrics;
 }): WalletController {
   return new WalletController(
     { execute: options.createWalletExecute ?? mock(async () => undefined) } as unknown as CreateWalletUseCase,
@@ -187,6 +211,7 @@ function walletController(options: {
     { execute: options.getLedgerExecute ?? mock(async () => undefined) } as unknown as GetWalletLedgerUseCase,
     { execute: options.reconcileExecute ?? mock(async () => undefined) } as unknown as ReconcileWalletUseCase,
     options.logger,
+    options.metrics,
   );
 }
 
@@ -207,5 +232,23 @@ function operationalLogger(overrides: Partial<OperationalLogger> = {}): Operatio
     info: overrides.info ?? (() => undefined),
     warn: overrides.warn ?? (() => undefined),
     error: overrides.error ?? (() => undefined),
+  };
+}
+
+function operationalMetrics(overrides: Partial<OperationalMetrics>): OperationalMetrics {
+  return {
+    recordWagerOutcome: overrides.recordWagerOutcome ?? (() => undefined),
+    recordRetry: overrides.recordRetry ?? (() => undefined),
+    recordDeadLetterMessage:
+      overrides.recordDeadLetterMessage ?? (() => undefined),
+    recordLockConflict: overrides.recordLockConflict ?? (() => undefined),
+    recordReconciliationDivergence:
+      overrides.recordReconciliationDivergence ?? (() => undefined),
+    setOutboxState: overrides.setOutboxState ?? (() => undefined),
+    setReadiness: overrides.setReadiness ?? (() => undefined),
+    recordCollectionFailure:
+      overrides.recordCollectionFailure ?? (() => undefined),
+    contentType: () => 'text/plain',
+    render: async () => '',
   };
 }

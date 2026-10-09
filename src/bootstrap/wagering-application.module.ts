@@ -3,6 +3,10 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
 
 import type { Clock } from '../application/ports/clock.js';
 import { CLOCK } from '../application/ports/clock.js';
+import {
+  OPERATIONAL_METRICS,
+  type OperationalMetrics,
+} from '../application/ports/operational-metrics.js';
 import type { IdGenerator } from '../application/ports/id-generator.js';
 import { ID_GENERATOR } from '../application/ports/id-generator.js';
 import type { UnitOfWork } from '../application/ports/persistence/unit-of-work.js';
@@ -59,16 +63,19 @@ import { SystemClock } from '../infrastructure/time/system-clock.js';
         PERSISTENCE_UNIT_OF_WORK,
         WagerTransactionExecutor,
         MikroOrmPersistenceConflictClassifier,
+        OPERATIONAL_METRICS,
       ],
       useFactory: (
         unitOfWork: UnitOfWork,
         executor: WagerTransactionExecutor,
         conflictClassifier: MikroOrmPersistenceConflictClassifier,
+        metrics: OperationalMetrics,
       ) =>
         new PersistentWagerTransactionProcessor(
           unitOfWork,
           executor,
           conflictClassifier,
+          metrics,
         ),
     },
     {
@@ -79,11 +86,21 @@ import { SystemClock } from '../infrastructure/time/system-clock.js';
     },
     {
       provide: ProcessWagerTransactionUseCase,
-      inject: [WAGER_TRANSACTION_PROCESSOR, WagerPayloadFingerprintService],
+      inject: [
+        WAGER_TRANSACTION_PROCESSOR,
+        WagerPayloadFingerprintService,
+        OPERATIONAL_METRICS,
+      ],
       useFactory: (
         processor: WagerTransactionProcessor,
         payloadFingerprint: WagerPayloadFingerprintService,
-      ) => new ProcessWagerTransactionUseCase(processor, payloadFingerprint),
+        metrics: OperationalMetrics,
+      ) =>
+        new ProcessWagerTransactionUseCase(
+          processor,
+          payloadFingerprint,
+          metrics,
+        ),
     },
     {
       provide: GetWagerTransactionByIdUseCase,

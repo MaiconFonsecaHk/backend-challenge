@@ -1,4 +1,8 @@
-import { UniqueConstraintViolationException } from '@mikro-orm/core';
+import {
+  DeadlockException,
+  LockWaitTimeoutException,
+  UniqueConstraintViolationException,
+} from '@mikro-orm/core';
 
 import type { PersistenceConflictClassifier } from '../../application/ports/persistence/persistence-conflict-classifier.js';
 
@@ -24,6 +28,13 @@ export class MikroOrmPersistenceConflictClassifier
     return (
       error instanceof UniqueConstraintViolationException &&
       (error as ConstraintError).constraint === INBOX_IDENTITY_CONSTRAINT
+    );
+  }
+
+  isLockConflict(error: unknown): boolean {
+    return (
+      error instanceof DeadlockException ||
+      error instanceof LockWaitTimeoutException
     );
   }
 }

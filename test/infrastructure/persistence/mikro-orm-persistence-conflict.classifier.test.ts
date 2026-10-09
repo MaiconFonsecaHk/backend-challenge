@@ -1,5 +1,9 @@
 import { describe, expect, test } from 'bun:test';
-import { UniqueConstraintViolationException } from '@mikro-orm/core';
+import {
+  DeadlockException,
+  LockWaitTimeoutException,
+  UniqueConstraintViolationException,
+} from '@mikro-orm/core';
 
 import { MikroOrmPersistenceConflictClassifier } from '../../../src/infrastructure/persistence/mikro-orm-persistence-conflict.classifier.js';
 
@@ -45,5 +49,17 @@ describe('MikroOrmPersistenceConflictClassifier', () => {
     expect(
       classifier.isInboxIdentityConflict(new Error('not a DB conflict')),
     ).toBe(false);
+  });
+
+  test('recognizes deadlocks and lock-wait timeouts as contention', () => {
+    expect(classifier.isLockConflict(new DeadlockException(new Error()))).toBe(
+      true,
+    );
+    expect(
+      classifier.isLockConflict(new LockWaitTimeoutException(new Error())),
+    ).toBe(true);
+    expect(classifier.isLockConflict(new Error('ordinary failure'))).toBe(
+      false,
+    );
   });
 });

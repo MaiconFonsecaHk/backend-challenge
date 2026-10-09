@@ -23,6 +23,11 @@ import {
   NOOP_OPERATIONAL_LOGGER,
   type OperationalLogger,
 } from '../../application/ports/operational-logger.js';
+import {
+  OPERATIONAL_METRICS,
+  NOOP_OPERATIONAL_METRICS,
+  type OperationalMetrics,
+} from '../../application/ports/operational-metrics.js';
 import { SQS_CLIENT } from '../../infrastructure/messaging/sqs.constants.js';
 import {
   isTransientWagerMessageError,
@@ -50,6 +55,8 @@ export class SqsWagerConsumer
     private readonly handler: SqsWagerMessageHandler,
     @Inject(OPERATIONAL_LOGGER)
     private readonly logger: OperationalLogger = NOOP_OPERATIONAL_LOGGER,
+    @Inject(OPERATIONAL_METRICS)
+    private readonly metrics: OperationalMetrics = NOOP_OPERATIONAL_METRICS,
   ) {}
 
   async onApplicationBootstrap(): Promise<void> {
@@ -192,6 +199,7 @@ export class SqsWagerConsumer
       attempt: receiveCount,
       retryable: true,
     });
+    this.metrics.recordRetry('sqs_wager_consumer');
   }
 
   private async moveToDeadLetterQueue(message: Message): Promise<void> {
@@ -220,6 +228,7 @@ export class SqsWagerConsumer
       attempt: parseReceiveCount(message.Attributes?.ApproximateReceiveCount),
       retryable: false,
     });
+    this.metrics.recordDeadLetterMessage();
   }
 
   private deleteMessage(receiptHandle: string): Promise<unknown> {

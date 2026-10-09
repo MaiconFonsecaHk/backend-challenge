@@ -2,6 +2,7 @@ import { describe, expect, mock, test } from 'bun:test';
 
 import type { Clock } from '../../../src/application/ports/clock.js';
 import type { OperationalLogger } from '../../../src/application/ports/operational-logger.js';
+import type { OperationalMetrics } from '../../../src/application/ports/operational-metrics.js';
 import type {
   OutboxEventPublication,
   OutboxEventTransport,
@@ -37,10 +38,12 @@ describe('PublishOutboxBatchUseCase', () => {
     const failed = message('50000000-0000-4000-8000-000000000703');
     const published = message('50000000-0000-4000-8000-000000000704');
     const warn = mock(() => undefined);
+    const recordRetry = mock(() => undefined);
     const harness = createHarness(
       [failed, published],
       failed.id,
       operationalLogger({ warn }),
+      operationalMetrics({ recordRetry }),
     );
 
     const result = await harness.useCase.execute(2);
@@ -61,6 +64,7 @@ describe('PublishOutboxBatchUseCase', () => {
       attempt: 1,
       retryable: true,
     });
+    expect(recordRetry).toHaveBeenCalledWith('outbox_publisher');
   });
 
   test('does no transport or persistence work when no event is due', async () => {
@@ -108,6 +112,7 @@ function createHarness(
   messages: readonly OutboxMessage[],
   failingId?: string,
   logger?: OperationalLogger,
+  metrics?: OperationalMetrics,
 ): {
   readonly useCase: PublishOutboxBatchUseCase;
   readonly queries: Array<{ now: Date; limit: number }>;
@@ -153,11 +158,30 @@ function createHarness(
       clock,
       new ExponentialOutboxRetryPolicy(5, 300),
       logger,
+      metrics,
     ),
     queries,
     publications,
     saved,
     unitOfWorkCalls: () => calls,
+  };
+}
+
+function operationalMetrics(overrides: Partial<OperationalMetrics>): OperationalMetrics {
+  return {
+    recordWagerOutcome: overrides.recordWagerOutcome ?? (() => undefined),
+    recordRetry: overrides.recordRetry ?? (() => undefined),
+    recordDeadLetterMessage:
+      overrides.recordDeadLetterMessage ?? (() => undefined),
+    recordLockConflict: overrides.recordLockConflict ?? (() => undefined),
+    recordReconciliationDivergence:
+      overrides.recordReconciliationDivergence ?? (() => undefined),
+    setOutboxState: overrides.setOutboxState ?? (() => undefined),
+    setReadiness: overrides.setReadiness ?? (() => undefined),
+    recordCollectionFailure:
+      overrides.recordCollectionFailure ?? (() => undefined),
+    contentType: () => 'text/plain',
+    render: async () => '',
   };
 }
 

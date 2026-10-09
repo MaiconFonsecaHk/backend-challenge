@@ -1,6 +1,9 @@
 import type { EntityManager } from '@mikro-orm/postgresql';
 
-import type { OutboxMessageRepository } from '../../../application/ports/persistence/repositories.js';
+import type {
+  OutboxMessageRepository,
+  OutboxPendingSnapshot,
+} from '../../../application/ports/persistence/repositories.js';
 import { OutboxMessage } from '../../../domain/messaging/outbox-message.js';
 import { OutboxMessagePersistenceEntity } from '../entities/outbox-message.persistence-entity.js';
 import { OutboxMessagePersistenceMapper } from '../mappers/outbox-message.persistence-mapper.js';
@@ -17,6 +20,11 @@ interface DueOutboxRow {
   readonly publishedAt: Date | string | null;
 }
 
+interface PendingOutboxSnapshotRow {
+  readonly pendingMessages: string;
+  readonly oldestPendingAt: Date | string | null;
+}
+
 export class MikroOrmOutboxMessageRepository implements OutboxMessageRepository {
   constructor(private readonly entityManager: EntityManager) {}
 
@@ -29,6 +37,32 @@ export class MikroOrmOutboxMessageRepository implements OutboxMessageRepository 
     return entity === null
       ? undefined
       : OutboxMessagePersistenceMapper.toDomain(entity);
+  }
+
+  async getPendingSnapshot(): Promise<OutboxPendingSnapshot> {
+    const rows = await this.entityManager.execute<PendingOutboxSnapshotRow[]>(
+      `select count(*)::text as "pendingMessages",
+              min(occurred_at) as "oldestPendingAt"
+         from outbox_messages
+        where published_at is null`,
+      [],
+      'all',
+    );
+    const row = rows[0];
+    if (row === undefined || !/^\d+$/.test(row.pendingMessages)) {
+      throw new Error('PostgreSQL returned an invalid pending outbox count.');
+    }
+    const pendingMessages = Number(row.pendingMessages);
+    if (!Number.isSafeInteger(pendingMessages)) {
+      throw new Error('Pending outbox count exceeds the safe integer range.');
+    }
+
+    return Object.freeze({
+      pendingMessages,
+      ...(row.oldestPendingAt === null
+        ? {}
+        : { oldestPendingAt: parsePostgreSqlTimestamp(row.oldestPendingAt) }),
+    });
   }
 
   async findDueForUpdate(

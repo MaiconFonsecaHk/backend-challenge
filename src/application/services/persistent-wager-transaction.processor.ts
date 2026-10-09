@@ -4,6 +4,10 @@ import {
 } from '../errors/wager-application.error.js';
 import { WalletNotFoundError } from '../errors/wallet-application.error.js';
 import type { PersistenceConflictClassifier } from '../ports/persistence/persistence-conflict-classifier.js';
+import {
+  NOOP_OPERATIONAL_METRICS,
+  type OperationalMetrics,
+} from '../ports/operational-metrics.js';
 import type {
   PersistenceRepositories,
   WagerTransactionRecord,
@@ -30,6 +34,7 @@ export class PersistentWagerTransactionProcessor
     private readonly unitOfWork: UnitOfWork,
     private readonly newTransactionExecutor: NewWagerTransactionExecutor,
     private readonly conflictClassifier: PersistenceConflictClassifier,
+    private readonly metrics: OperationalMetrics = NOOP_OPERATIONAL_METRICS,
   ) {}
 
   async process(
@@ -40,6 +45,9 @@ export class PersistentWagerTransactionProcessor
         this.processInTransaction(command, repositories),
       );
     } catch (error) {
+      if (this.conflictClassifier.isLockConflict(error)) {
+        this.metrics.recordLockConflict(command.kind);
+      }
       const recoverableConflict =
         this.conflictClassifier.isWagerIdempotencyKeyConflict(error) ||
         this.conflictClassifier.isInboxIdentityConflict(error);

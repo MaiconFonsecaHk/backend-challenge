@@ -422,6 +422,26 @@ describe('MikroORM repositories', () => {
     expect(outboxDouble.executeCalls[0]?.method).toBe('all');
   });
 
+  test('reads one exact pending-outbox snapshot for metrics', async () => {
+    const oldestPendingAt = new Date('2026-10-08T11:59:30.000Z');
+    const double = entityManagerDouble(null, [], [
+      { pendingMessages: '7', oldestPendingAt },
+    ]);
+    const repository = new MikroOrmOutboxMessageRepository(
+      double.entityManager,
+    );
+
+    expect(await repository.getPendingSnapshot()).toEqual({
+      pendingMessages: 7,
+      oldestPendingAt,
+    });
+    expect(double.executeCalls[0]?.query).toContain(
+      'where published_at is null',
+    );
+    expect(double.executeCalls[0]?.params).toEqual([]);
+    expect(double.executeCalls[0]?.method).toBe('all');
+  });
+
   test('reconciles wallet and ledger from one exact aggregate query', async () => {
     const executeCalls: Array<{
       query: string;

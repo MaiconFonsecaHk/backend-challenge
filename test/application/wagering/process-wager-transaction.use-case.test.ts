@@ -1,10 +1,14 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, mock, test } from 'bun:test';
 
 import {
   ExternalOpeningNotAllowedError,
   InvalidWagerCommandError,
 } from '../../../src/application/errors/wager-application.error.js';
 import type { PayloadDigest } from '../../../src/application/ports/payload-digest.js';
+import type {
+  OperationalMetrics,
+  WagerOutcomeMetric,
+} from '../../../src/application/ports/operational-metrics.js';
 import type {
   ProcessWagerTransactionResult,
   WagerTransactionProcessor,
@@ -64,7 +68,10 @@ class PayloadDigestDouble implements PayloadDigest {
   }
 }
 
-function createUseCase(processor: WagerTransactionProcessor): {
+function createUseCase(
+  processor: WagerTransactionProcessor,
+  metrics?: OperationalMetrics,
+): {
   readonly useCase: ProcessWagerTransactionUseCase;
   readonly digest: PayloadDigestDouble;
 } {
@@ -74,6 +81,7 @@ function createUseCase(processor: WagerTransactionProcessor): {
     useCase: new ProcessWagerTransactionUseCase(
       processor,
       new WagerPayloadFingerprintService(digest),
+      metrics,
     ),
     digest,
   };
@@ -171,6 +179,38 @@ describe('ProcessWagerTransactionUseCase', () => {
     });
     expect(processor.commands[0]?.delivery?.receivedAt).not.toBe(receivedAt);
     expect(digest.canonicalPayloads[0]).not.toContain('message-501');
+  });
+
+  test('records status, duplicate detection, source and processing latency', async () => {
+    const recordWagerOutcome = mock((_outcome: WagerOutcomeMetric) => undefined);
+    const metrics = metricsDouble({ recordWagerOutcome });
+    const processor = new ProcessorDouble({
+      ...processedResult(),
+      idempotentReplay: true,
+    });
+    const { useCase } = createUseCase(processor, metrics);
+
+    await useCase.execute(
+      command({
+        delivery: {
+          consumerName: 'wager-transactions-consumer',
+          messageId: 'message-501',
+          payloadHash: 'message-payload-hash',
+          receivedAt: new Date('2026-10-08T20:00:00.000Z'),
+        },
+      }),
+    );
+
+    expect(recordWagerOutcome).toHaveBeenCalledWith({
+      source: 'sqs',
+      operation: WagerTransactionKind.Bet,
+      status: WagerTransactionStatus.Processed,
+      idempotentReplay: true,
+      durationSeconds: expect.any(Number),
+    });
+    const recordedOutcome = recordWagerOutcome.mock.calls[0]?.[0];
+    expect(recordedOutcome).toBeDefined();
+    expect(recordedOutcome!.durationSeconds).toBeGreaterThanOrEqual(0);
   });
 
   test.each([
@@ -291,3 +331,21 @@ describe('ProcessWagerTransactionUseCase', () => {
     },
   );
 });
+
+function metricsDouble(overrides: Partial<OperationalMetrics>): OperationalMetrics {
+  return {
+    recordWagerOutcome: overrides.recordWagerOutcome ?? (() => undefined),
+    recordRetry: overrides.recordRetry ?? (() => undefined),
+    recordDeadLetterMessage:
+      overrides.recordDeadLetterMessage ?? (() => undefined),
+    recordLockConflict: overrides.recordLockConflict ?? (() => undefined),
+    recordReconciliationDivergence:
+      overrides.recordReconciliationDivergence ?? (() => undefined),
+    setOutboxState: overrides.setOutboxState ?? (() => undefined),
+    setReadiness: overrides.setReadiness ?? (() => undefined),
+    recordCollectionFailure:
+      overrides.recordCollectionFailure ?? (() => undefined),
+    contentType: () => 'text/plain',
+    render: async () => '',
+  };
+}

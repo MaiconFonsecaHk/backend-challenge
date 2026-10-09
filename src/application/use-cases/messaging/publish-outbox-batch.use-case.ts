@@ -4,6 +4,10 @@ import {
   type OperationalLogContext,
   type OperationalLogger,
 } from '../../ports/operational-logger.js';
+import {
+  NOOP_OPERATIONAL_METRICS,
+  type OperationalMetrics,
+} from '../../ports/operational-metrics.js';
 import type {
   OutboxEventPublication,
   OutboxEventTransport,
@@ -24,6 +28,7 @@ export class PublishOutboxBatchUseCase {
     private readonly clock: Clock,
     private readonly retryPolicy: OutboxRetryPolicy,
     private readonly logger: OperationalLogger = NOOP_OPERATIONAL_LOGGER,
+    private readonly metrics: OperationalMetrics = NOOP_OPERATIONAL_METRICS,
   ) {}
 
   async execute(limit: number): Promise<PublishOutboxBatchResult> {
@@ -80,6 +85,7 @@ export class PublishOutboxBatchUseCase {
 
     for (const context of execution.retries) {
       this.logger.warn('outbox.publish.retry_scheduled', context);
+      this.metrics.recordRetry('outbox_publisher');
     }
     return execution.result;
   }

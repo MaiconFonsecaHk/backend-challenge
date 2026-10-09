@@ -3,6 +3,10 @@ import { describe, expect, mock, test } from 'bun:test';
 import type { Clock } from '../../../src/application/ports/clock.js';
 import type { OperationalLogger } from '../../../src/application/ports/operational-logger.js';
 import type {
+  OperationalMetrics,
+  WagerOutcomeMetric,
+} from '../../../src/application/ports/operational-metrics.js';
+import type {
   PersistenceRepositories,
   WagerTransactionRecord,
 } from '../../../src/application/ports/persistence/repositories.js';
@@ -69,6 +73,10 @@ describe('ProcessPendingReferencesBatchUseCase', () => {
   test('claims one transaction per unit of work and counts every terminal outcome', async () => {
     const info = mock(() => undefined);
     const warn = mock(() => undefined);
+    const recordRetry = mock(() => undefined);
+    const recordWagerOutcome = mock(
+      (_outcome: WagerOutcomeMetric) => undefined,
+    );
     const claimed = [
       record('30000000-0000-4000-8000-000000000811', WagerTransactionStatus.PendingReference),
       record('30000000-0000-4000-8000-000000000812', WagerTransactionStatus.PendingReference),
@@ -120,6 +128,7 @@ describe('ProcessPendingReferencesBatchUseCase', () => {
       executor,
       new FixedClock(),
       operationalLogger({ info, warn }),
+      operationalMetrics({ recordRetry, recordWagerOutcome }),
     );
 
     expect(await useCase.execute(10)).toEqual({
@@ -146,6 +155,22 @@ describe('ProcessPendingReferencesBatchUseCase', () => {
       expect.objectContaining({
         transactionId: '30000000-0000-4000-8000-000000000812',
         failureCode: 'REFERENCE_NOT_FOUND',
+      }),
+    );
+    expect(recordRetry).toHaveBeenCalledWith('pending_reference_worker');
+    expect(recordWagerOutcome).toHaveBeenCalledTimes(2);
+    expect(recordWagerOutcome).toHaveBeenCalledWith(
+      expect.objectContaining({
+        source: 'pending_reference_worker',
+        status: WagerTransactionStatus.Processed,
+        idempotentReplay: false,
+      }),
+    );
+    expect(recordWagerOutcome).toHaveBeenCalledWith(
+      expect.objectContaining({
+        source: 'pending_reference_worker',
+        status: WagerTransactionStatus.Rejected,
+        idempotentReplay: false,
       }),
     );
     expect(warn).toHaveBeenCalledWith(
@@ -186,5 +211,23 @@ function operationalLogger(overrides: Partial<OperationalLogger> = {}): Operatio
     info: overrides.info ?? (() => undefined),
     warn: overrides.warn ?? (() => undefined),
     error: overrides.error ?? (() => undefined),
+  };
+}
+
+function operationalMetrics(overrides: Partial<OperationalMetrics>): OperationalMetrics {
+  return {
+    recordWagerOutcome: overrides.recordWagerOutcome ?? (() => undefined),
+    recordRetry: overrides.recordRetry ?? (() => undefined),
+    recordDeadLetterMessage:
+      overrides.recordDeadLetterMessage ?? (() => undefined),
+    recordLockConflict: overrides.recordLockConflict ?? (() => undefined),
+    recordReconciliationDivergence:
+      overrides.recordReconciliationDivergence ?? (() => undefined),
+    setOutboxState: overrides.setOutboxState ?? (() => undefined),
+    setReadiness: overrides.setReadiness ?? (() => undefined),
+    recordCollectionFailure:
+      overrides.recordCollectionFailure ?? (() => undefined),
+    contentType: () => 'text/plain',
+    render: async () => '',
   };
 }

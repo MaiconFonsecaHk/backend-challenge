@@ -9,6 +9,7 @@ import {
 import type { ConfigService } from '@nestjs/config';
 
 import type { OperationalLogger } from '../../../src/application/ports/operational-logger.js';
+import type { OperationalMetrics } from '../../../src/application/ports/operational-metrics.js';
 import type { EnvironmentVariables } from '../../../src/config/environment.schema.js';
 import { SqsWagerConsumer } from '../../../src/interfaces/messaging/sqs-wager.consumer.js';
 import { InvalidSqsWagerMessageError } from '../../../src/interfaces/messaging/sqs-wager-message.error.js';
@@ -64,6 +65,7 @@ describe('SQS wager consumer', () => {
   test('backs off a transient failure without acknowledging the message', async () => {
     const commands: unknown[] = [];
     const warn = mock(() => undefined);
+    const recordRetry = mock(() => undefined);
     const transient = Object.assign(new Error('temporary timeout'), {
       code: 'ETIMEDOUT',
     });
@@ -73,6 +75,7 @@ describe('SQS wager consumer', () => {
         throw transient;
       },
       operationalLogger({ warn }),
+      operationalMetrics({ recordRetry }),
     );
 
     await processBatch(consumer, [
@@ -94,6 +97,7 @@ describe('SQS wager consumer', () => {
       attempt: 2,
       retryable: true,
     });
+    expect(recordRetry).toHaveBeenCalledWith('sqs_wager_consumer');
   });
 
   test('leaves an exhausted transient message for native redrive', async () => {
@@ -112,12 +116,14 @@ describe('SQS wager consumer', () => {
   test('moves a permanent failure to the DLQ before deleting the source', async () => {
     const commands: unknown[] = [];
     const error = mock(() => undefined);
+    const recordDeadLetterMessage = mock(() => undefined);
     const consumer = consumerHarness(
       commands,
       async () => {
         throw new InvalidSqsWagerMessageError();
       },
       operationalLogger({ error }),
+      operationalMetrics({ recordDeadLetterMessage }),
     );
 
     await processBatch(consumer, [message('message-4', 'wallet-a')]);
@@ -139,6 +145,7 @@ describe('SQS wager consumer', () => {
       attempt: 1,
       retryable: false,
     });
+    expect(recordDeadLetterMessage).toHaveBeenCalledTimes(1);
   });
 
   test('leaves a successfully processed message for redelivery when its ack fails', async () => {
@@ -185,6 +192,7 @@ function consumerHarness(
   commands: unknown[],
   handle: (body: string | undefined, group: string | undefined) => Promise<unknown>,
   logger?: OperationalLogger,
+  metrics?: OperationalMetrics,
 ): SqsWagerConsumer {
   const client = {
     send: mock(async (command: unknown) => {
@@ -205,6 +213,7 @@ function consumerHarness(
     config,
     { handle } as unknown as SqsWagerMessageHandler,
     logger,
+    metrics,
   );
   const internals = consumer as unknown as {
     queueUrl: string;
@@ -220,6 +229,24 @@ function operationalLogger(overrides: Partial<OperationalLogger> = {}): Operatio
     info: overrides.info ?? (() => undefined),
     warn: overrides.warn ?? (() => undefined),
     error: overrides.error ?? (() => undefined),
+  };
+}
+
+function operationalMetrics(overrides: Partial<OperationalMetrics>): OperationalMetrics {
+  return {
+    recordWagerOutcome: overrides.recordWagerOutcome ?? (() => undefined),
+    recordRetry: overrides.recordRetry ?? (() => undefined),
+    recordDeadLetterMessage:
+      overrides.recordDeadLetterMessage ?? (() => undefined),
+    recordLockConflict: overrides.recordLockConflict ?? (() => undefined),
+    recordReconciliationDivergence:
+      overrides.recordReconciliationDivergence ?? (() => undefined),
+    setOutboxState: overrides.setOutboxState ?? (() => undefined),
+    setReadiness: overrides.setReadiness ?? (() => undefined),
+    recordCollectionFailure:
+      overrides.recordCollectionFailure ?? (() => undefined),
+    contentType: () => 'text/plain',
+    render: async () => '',
   };
 }
 

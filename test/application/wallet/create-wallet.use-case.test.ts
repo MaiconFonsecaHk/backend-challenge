@@ -108,6 +108,7 @@ function persistenceDouble(existingWallet?: Wallet): {
     },
     outboxMessages: {
       findById: async () => undefined,
+      getPendingSnapshot: async () => ({ pendingMessages: 0 }),
       findDueForUpdate: async () => [],
       add: async (message) => {
         capture.outboxMessages.push(message);
