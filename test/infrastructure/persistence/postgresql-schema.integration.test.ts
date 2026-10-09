@@ -17,6 +17,7 @@ import type {
   PersistenceRepositories,
   WalletRepository,
   WagerTransactionRecord,
+  WagerTransactionRepository,
 } from '../../../src/application/ports/persistence/repositories.js';
 import type { UnitOfWork } from '../../../src/application/ports/persistence/unit-of-work.js';
 import type {
@@ -207,6 +208,10 @@ class PublicationBarrier {
     }
     await this.ready;
   }
+
+  get arrivalCount(): number {
+    return this.arrivals;
+  }
 }
 
 function synchronizeWalletLookup(
@@ -234,6 +239,48 @@ function synchronizeWalletLookup(
         };
 
         return work({ ...repositories, wallets: walletRepository });
+      }),
+  };
+}
+
+function synchronizeMissingIdempotencyLookup(
+  unitOfWork: UnitOfWork,
+  barrier: PublicationBarrier,
+): UnitOfWork {
+  return {
+    execute: <T>(work: (repositories: PersistenceRepositories) => Promise<T>) =>
+      unitOfWork.execute(async (repositories) => {
+        const wagerTransactions: WagerTransactionRepository = {
+          findById: (id) => repositories.wagerTransactions.findById(id),
+          findNextPendingReferenceDueForUpdate: (now) =>
+            repositories.wagerTransactions.findNextPendingReferenceDueForUpdate(
+              now,
+            ),
+          findByIdempotencyKey: async (idempotencyKey) => {
+            const record =
+              await repositories.wagerTransactions.findByIdempotencyKey(
+                idempotencyKey,
+              );
+            if (record === undefined) {
+              await barrier.arrive();
+            }
+            return record;
+          },
+          findByProviderTransaction: (providerId, externalTransactionId) =>
+            repositories.wagerTransactions.findByProviderTransaction(
+              providerId,
+              externalTransactionId,
+            ),
+          findByReferenceAndKind: (referenceTransactionId, kind) =>
+            repositories.wagerTransactions.findByReferenceAndKind(
+              referenceTransactionId,
+              kind,
+            ),
+          add: (record) => repositories.wagerTransactions.add(record),
+          save: (record) => repositories.wagerTransactions.save(record),
+        };
+
+        return work({ ...repositories, wagerTransactions });
       }),
   };
 }
@@ -2229,25 +2276,38 @@ describePostgreSql('PostgreSQL schema integration', () => {
     });
   });
 
-  test('deduplicates 50 concurrent submissions and preserves the committed result', async () => {
+  test('deduplicates 50 concurrent bets into one debit and one ledger effect', async () => {
     const walletId = '10000000-0000-4000-8000-000000000109';
     const playerId = '20000000-0000-4000-8000-000000000109';
     const idempotencyKey = 'provider-idempotency:external-109';
     const unitOfWork = new MikroOrmUnitOfWork(requiredApplicationOrm());
     await createWalletUseCase(
       unitOfWork,
-      new SequenceIdGenerator([walletId]),
+      new SequenceIdGenerator([
+        walletId,
+        '30000000-0000-4000-8000-000000000109',
+        '40000000-0000-4000-8000-000000000109',
+        '50000000-0000-4000-8000-000000000109',
+      ]),
       new FixedClock(CREATED_AT),
     ).execute({
       playerId,
-      initialBalance: { amount: '0.00', currency: 'BRL' },
+      initialBalance: { amount: '100.00', currency: 'BRL' },
       correlationId: 'wallet-create-integration-109',
     });
 
-    const executor = new ConcurrentLossExecutor(3);
-    const processor = new PersistentWagerTransactionProcessor(
+    const barrier = new PublicationBarrier(3);
+    const contendedUnitOfWork = synchronizeMissingIdempotencyLookup(
       unitOfWork,
-      executor,
+      barrier,
+    );
+    const processor = new PersistentWagerTransactionProcessor(
+      contendedUnitOfWork,
+      new WagerTransactionExecutor(
+        new UuidGenerator(),
+        new FixedClock(PROCESSED_AT),
+        new PendingReferenceRetryPolicy(30, 3_600, 86_400),
+      ),
       new MikroOrmPersistenceConflictClassifier(),
     );
     const useCase = new ProcessWagerTransactionUseCase(
@@ -2262,7 +2322,7 @@ describePostgreSql('PostgreSQL schema integration', () => {
       walletId,
       roundId: 'round-109',
       gameId: 'game-109',
-      kind: WagerTransactionKind.Loss,
+      kind: WagerTransactionKind.Bet,
       money: { amount: '10.00', currency: 'BRL' },
       correlationId: 'correlation-109',
     } as const;
@@ -2285,11 +2345,11 @@ describePostgreSql('PostgreSQL schema integration', () => {
       results.every(
         (result) =>
           result.status === WagerTransactionStatus.Processed &&
-          result.balance?.amount === '0.00' &&
+          result.balance?.amount === '90.00' &&
           result.balance.currency === 'BRL',
       ),
     ).toBe(true);
-    expect(executor.executions).toBeGreaterThanOrEqual(3);
+    expect(barrier.arrivalCount).toBeGreaterThanOrEqual(3);
     const committedTransactionId = results[0]?.transactionId;
     if (committedTransactionId === undefined) {
       throw new Error('Concurrent submissions returned no result');
@@ -2302,7 +2362,7 @@ describePostgreSql('PostgreSQL schema integration', () => {
     expect(replay).toEqual({
       transactionId: committedTransactionId,
       status: WagerTransactionStatus.Processed,
-      balance: { amount: '0.00', currency: 'BRL' },
+      balance: { amount: '90.00', currency: 'BRL' },
       idempotentReplay: true,
     });
     await expect(
@@ -2312,23 +2372,52 @@ describePostgreSql('PostgreSQL schema integration', () => {
       }),
     ).rejects.toBeInstanceOf(IdempotencyConflictError);
 
-    const [transactionCount] = await requiredApplicationOrm().em
+    const [counts] = await requiredApplicationOrm().em
       .getConnection()
-      .execute<Array<{ count: string }>>(
-        `select count(*)::text as count
-           from wager_transactions
-          where idempotency_key = ?`,
-        [idempotencyKey],
+      .execute<
+        Array<{
+          balance_event_count: string;
+          ledger_count: string;
+          processed_event_count: string;
+          transaction_count: string;
+        }>
+      >(
+        `select
+           (select count(*)::text
+              from wager_transactions
+             where idempotency_key = ?) as transaction_count,
+           (select count(*)::text
+              from wallet_ledger_entries
+             where transaction_id = ?) as ledger_count,
+           (select count(*)::text
+              from outbox_messages
+             where event_type = 'WagerTransactionProcessed'
+               and payload -> 'data' ->> 'transactionId' = ?) as processed_event_count,
+           (select count(*)::text
+              from outbox_messages
+             where event_type = 'WalletBalanceChanged'
+               and payload -> 'data' ->> 'transactionId' = ?) as balance_event_count`,
+        [
+          idempotencyKey,
+          committedTransactionId,
+          committedTransactionId,
+          committedTransactionId,
+        ],
       );
-    const [outboxCount] = await requiredApplicationOrm().em
-      .getConnection()
-      .execute<Array<{ count: string }>>(
-        `select count(*)::text as count
-           from outbox_messages
-          where event_type = 'IdempotencyProbeProcessed'`,
-      );
-    expect(transactionCount?.count).toBe('1');
-    expect(outboxCount?.count).toBe('1');
+    expect(counts).toEqual({
+      transaction_count: '1',
+      ledger_count: '1',
+      processed_event_count: '1',
+      balance_event_count: '1',
+    });
+    expect(await new ReconcileWalletUseCase(unitOfWork).execute(walletId)).toEqual({
+      walletId,
+      storedBalance: { amount: '90.00', currency: 'BRL' },
+      calculatedBalance: { amount: '90.00', currency: 'BRL' },
+      difference: { amount: '0.00', currency: 'BRL' },
+      consistent: true,
+      checkedEntries: 2,
+    });
   });
 
   test('rolls back every wallet-opening effect when its transaction cannot persist', async () => {
