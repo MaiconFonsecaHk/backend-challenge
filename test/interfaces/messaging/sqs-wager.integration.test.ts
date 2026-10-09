@@ -5,6 +5,7 @@ import {
   DeleteMessageCommand,
   DeleteQueueCommand,
   GetQueueAttributesCommand,
+  GetQueueUrlCommand,
   ReceiveMessageCommand,
   SendMessageCommand,
   SQSClient,
@@ -229,6 +230,120 @@ describeSqs('SQS wager consumer integration', () => {
     expect(await receive(queueUrl, 1)).toBeUndefined();
   }, 20_000);
 
+  test('provisions three configured queue names and becomes healthy through the configured main queue', async () => {
+    const suffix = crypto.randomUUID().replaceAll('-', '').slice(0, 12);
+    const projectName = `backend-challenge-aud07-${suffix}`;
+    const customNames = {
+      main: `audit-${suffix}-wagers.fifo`,
+      deadLetter: `audit-${suffix}-wagers-dlq.fifo`,
+      events: `audit-${suffix}-events.fifo`,
+    };
+    const environment = {
+      INTEGRATION_EVENTS_QUEUE_NAME: customNames.events,
+      MINISTACK_PORT: '0',
+      SQS_MAX_RECEIVE_COUNT: '3',
+      SQS_VISIBILITY_TIMEOUT_SECONDS: '7',
+      WAGER_TRANSACTIONS_DLQ_NAME: customNames.deadLetter,
+      WAGER_TRANSACTIONS_QUEUE_NAME: customNames.main,
+    };
+
+    try {
+      await runCompose(
+        projectName,
+        ['up', '--detach', '--wait', '--wait-timeout', '30', 'ministack'],
+        environment,
+      );
+      const publishedAddress = (
+        await runCompose(
+          projectName,
+          ['port', 'ministack', '4566'],
+          environment,
+        )
+      ).trim();
+      const isolatedClient = new SQSClient({
+        endpoint: `http://${publishedAddress}`,
+        region: process.env.AWS_REGION ?? 'us-east-1',
+        credentials: {
+          accessKeyId: process.env.AWS_ACCESS_KEY_ID ?? 'test',
+          secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY ?? 'test',
+        },
+      });
+
+      try {
+        const [main, deadLetter, events] = await Promise.all([
+          isolatedClient.send(
+            new GetQueueUrlCommand({ QueueName: customNames.main }),
+          ),
+          isolatedClient.send(
+            new GetQueueUrlCommand({ QueueName: customNames.deadLetter }),
+          ),
+          isolatedClient.send(
+            new GetQueueUrlCommand({ QueueName: customNames.events }),
+          ),
+        ]);
+        if (
+          main.QueueUrl === undefined ||
+          deadLetter.QueueUrl === undefined ||
+          events.QueueUrl === undefined
+        ) {
+          throw new Error('MiniStack returned an incomplete custom queue set.');
+        }
+        expect(main.QueueUrl).toContain(customNames.main);
+        expect(deadLetter.QueueUrl).toContain(customNames.deadLetter);
+        expect(events.QueueUrl).toContain(customNames.events);
+
+        const [mainAttributes, deadLetterAttributes, eventAttributes] =
+          await Promise.all([
+            isolatedClient.send(
+              new GetQueueAttributesCommand({
+                QueueUrl: main.QueueUrl,
+                AttributeNames: ['All'],
+              }),
+            ),
+            isolatedClient.send(
+              new GetQueueAttributesCommand({
+                QueueUrl: deadLetter.QueueUrl,
+                AttributeNames: ['QueueArn'],
+              }),
+            ),
+            isolatedClient.send(
+              new GetQueueAttributesCommand({
+                QueueUrl: events.QueueUrl,
+                AttributeNames: ['FifoQueue'],
+              }),
+            ),
+          ]);
+        const deadLetterArn = deadLetterAttributes.Attributes?.QueueArn;
+        if (deadLetterArn === undefined) {
+          throw new Error('Custom dead-letter queue returned no ARN.');
+        }
+        expect(mainAttributes.Attributes).toMatchObject({
+          FifoQueue: 'true',
+          ReceiveMessageWaitTimeSeconds: '20',
+          VisibilityTimeout: '7',
+        });
+        expect(JSON.parse(mainAttributes.Attributes?.RedrivePolicy ?? '')).toEqual({
+          deadLetterTargetArn: deadLetterArn,
+          maxReceiveCount: '3',
+        });
+        expect(eventAttributes.Attributes?.FifoQueue).toBe('true');
+        await expect(
+          isolatedClient.send(
+            new GetQueueUrlCommand({ QueueName: 'wager-transactions.fifo' }),
+          ),
+        ).rejects.toBeDefined();
+      } finally {
+        isolatedClient.destroy();
+      }
+    } finally {
+      await runCompose(
+        projectName,
+        ['down', '--remove-orphans'],
+        environment,
+      );
+    }
+  }, 45_000);
+
   test('publishes an outbox envelope with aggregate ordering and event deduplication', async () => {
     const eventId = '50000000-0000-4000-8000-000000000811';
     const aggregateId = '10000000-0000-4000-8000-000000000811';
@@ -406,4 +521,32 @@ async function waitForNativeRedrive(): Promise<Message> {
   } while (Date.now() < deadline);
 
   throw new Error('SQS did not redrive the exhausted message in time.');
+}
+
+async function runCompose(
+  projectName: string,
+  args: readonly string[],
+  environment: Readonly<Record<string, string>>,
+): Promise<string> {
+  const child = Bun.spawn(
+    ['docker', 'compose', '--project-name', projectName, ...args],
+    {
+      cwd: process.cwd(),
+      env: { ...process.env, ...environment },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    },
+  );
+  const [exitCode, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+  if (exitCode !== 0) {
+    throw new Error(
+      `docker compose ${args.join(' ')} failed with ${exitCode}. Output: ${stdout}. Error: ${stderr}`,
+    );
+  }
+
+  return stdout;
 }

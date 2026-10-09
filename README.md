@@ -106,6 +106,8 @@ O `.env.example` contém somente valores locais de desenvolvimento. Credenciais 
 | Outbox | `OUTBOX_BATCH_SIZE`, `OUTBOX_POLL_INTERVAL_MS`, `OUTBOX_RETRY_BASE_SECONDS`, `OUTBOX_RETRY_MAX_SECONDS` | lote, polling e retry do publisher |
 | Referências | `PENDING_REFERENCE_BATCH_SIZE`, `PENDING_REFERENCE_POLL_INTERVAL_MS`, `PENDING_REFERENCE_RETRY_BASE_SECONDS`, `PENDING_REFERENCE_RETRY_MAX_SECONDS`, `PENDING_REFERENCE_TTL_SECONDS` | reprocessamento e expiração de referências fora de ordem |
 
+`WAGER_TRANSACTIONS_QUEUE_NAME`, `WAGER_TRANSACTIONS_DLQ_NAME` e `INTEGRATION_EVENTS_QUEUE_NAME` são compartilhadas pela aplicação e pelo provisionamento do MiniStack. O healthcheck do container consulta a fila principal configurada. Se forem omitidas, permanecem os nomes `wager-transactions.fifo`, `wager-transactions-dlq.fifo` e `integration-events.fifo`.
+
 Se a porta publicada do MiniStack mudar por conflito com outro projeto Docker, altere `MINISTACK_PORT` e faça `SQS_ENDPOINT` apontar para a mesma porta. Os limites de retry, backoff e TTL são validados no startup; configurações incompatíveis impedem uma inicialização silenciosamente incorreta.
 
 ### Migrations
@@ -135,10 +137,10 @@ Na baseline documentada:
 
 - `bun run test`: 433 testes aprovados;
 - `bun run test:integration:postgres`: 25 testes aprovados;
-- `bun run test:integration:sqs`: 5 testes aprovados;
+- `bun run test:integration:sqs`: 6 testes aprovados;
 - type-check e build aprovados.
 
-As provas incluem 50 replays paralelos da mesma aposta com um único débito, disputa simultânea de duas apostas de `80.00 BRL` contra `100.00 BRL`, três processos Bun independentes sobre a mesma wallet, wallets distintas em paralelo, dois publishers, bloqueio da ordem FIFO durante retry, redelivery depois de commit e morte real antes do ack, referência entregue fora de ordem e morte abrupta de um processo com retomada do claim da outbox.
+As provas incluem 50 replays paralelos da mesma aposta com um único débito, disputa simultânea de duas apostas de `80.00 BRL` contra `100.00 BRL`, três processos Bun independentes sobre a mesma wallet, wallets distintas em paralelo, dois publishers, bloqueio da ordem FIFO durante retry, redelivery depois de commit e morte real antes do ack, referência entregue fora de ordem, morte abrupta de um processo com retomada do claim da outbox e provisionamento isolado das três filas com nomes alternativos.
 
 ### Endpoints
 
