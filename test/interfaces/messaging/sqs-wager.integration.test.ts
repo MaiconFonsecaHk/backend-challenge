@@ -13,6 +13,7 @@ import {
 import type { ConfigService } from '@nestjs/config';
 
 import type { EnvironmentVariables } from '../../../src/config/environment.schema.js';
+import { SqsOutboxEventTransport } from '../../../src/infrastructure/messaging/sqs-outbox-event.transport.js';
 import { SqsWagerConsumer } from '../../../src/interfaces/messaging/sqs-wager.consumer.js';
 import { InvalidSqsWagerMessageError } from '../../../src/interfaces/messaging/sqs-wager-message.error.js';
 import type { SqsWagerMessageHandler } from '../../../src/interfaces/messaging/sqs-wager-message.handler.js';
@@ -25,6 +26,8 @@ const MAX_RECEIVE_COUNT = 2;
 let client: SQSClient | undefined;
 let queueUrl = '';
 let deadLetterQueueUrl = '';
+let integrationEventsQueueName = '';
+let integrationEventsQueueUrl = '';
 
 describeSqs('SQS wager consumer integration', () => {
   beforeAll(async () => {
@@ -39,6 +42,7 @@ describeSqs('SQS wager consumer integration', () => {
     const suffix = crypto.randomUUID().replaceAll('-', '').slice(0, 12);
     const deadLetterQueueName = `wager-it-${suffix}-dlq.fifo`;
     const queueName = `wager-it-${suffix}.fifo`;
+    integrationEventsQueueName = `events-it-${suffix}.fifo`;
     const deadLetterQueue = await client.send(
       new CreateQueueCommand({
         QueueName: deadLetterQueueName,
@@ -77,6 +81,17 @@ describeSqs('SQS wager consumer integration', () => {
       throw new Error('SQS did not return the integration queue URL.');
     }
     queueUrl = queue.QueueUrl;
+
+    const integrationEventsQueue = await client.send(
+      new CreateQueueCommand({
+        QueueName: integrationEventsQueueName,
+        Attributes: { FifoQueue: 'true' },
+      }),
+    );
+    if (integrationEventsQueue.QueueUrl === undefined) {
+      throw new Error('SQS did not return the integration events queue URL.');
+    }
+    integrationEventsQueueUrl = integrationEventsQueue.QueueUrl;
   });
 
   afterAll(async () => {
@@ -89,6 +104,11 @@ describeSqs('SQS wager consumer integration', () => {
     if (deadLetterQueueUrl.length > 0) {
       await client.send(
         new DeleteQueueCommand({ QueueUrl: deadLetterQueueUrl }),
+      );
+    }
+    if (integrationEventsQueueUrl.length > 0) {
+      await client.send(
+        new DeleteQueueCommand({ QueueUrl: integrationEventsQueueUrl }),
       );
     }
     client.destroy();
@@ -169,6 +189,38 @@ describeSqs('SQS wager consumer integration', () => {
     expect(deadLetter.Body).toBe(messageBody);
     expect(await receive(queueUrl, 1)).toBeUndefined();
   }, 20_000);
+
+  test('publishes an outbox envelope with aggregate ordering and event deduplication', async () => {
+    const eventId = '50000000-0000-4000-8000-000000000811';
+    const aggregateId = '10000000-0000-4000-8000-000000000811';
+    const payload = {
+      eventId,
+      eventType: 'WalletBalanceChanged',
+      aggregateId,
+      correlationId: 'outbox-sqs-811',
+      occurredAt: '2026-10-09T12:00:00.000Z',
+      version: 1,
+      data: { walletId: aggregateId },
+    };
+    const config = {
+      get: () => integrationEventsQueueName,
+    } as unknown as ConfigService<EnvironmentVariables, true>;
+    const transport = new SqsOutboxEventTransport(requiredClient(), config);
+
+    await transport.publish({
+      id: eventId,
+      aggregateId,
+      eventType: 'WalletBalanceChanged',
+      payload,
+    });
+
+    const received = await receiveRequired(integrationEventsQueueUrl);
+    expect(JSON.parse(received.Body ?? '')).toEqual(payload);
+    expect(received.Attributes?.MessageGroupId).toBe(aggregateId);
+    expect(received.MessageAttributes?.eventType?.StringValue).toBe(
+      'WalletBalanceChanged',
+    );
+  });
 });
 
 function requiredClient(): SQSClient {
@@ -243,6 +295,7 @@ async function receive(
         'ApproximateReceiveCount',
         'MessageGroupId',
       ],
+      MessageAttributeNames: ['All'],
     }),
   );
   return response.Messages?.[0];

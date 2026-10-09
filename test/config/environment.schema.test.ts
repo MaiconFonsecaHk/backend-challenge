@@ -10,6 +10,7 @@ const validEnvironment = {
   POSTGRES_PORT: '5432',
   POSTGRES_USER: 'backend_challenge',
   SQS_ENDPOINT: 'http://127.0.0.1:4566',
+  INTEGRATION_EVENTS_QUEUE_NAME: 'integration-events.fifo',
   WAGER_TRANSACTIONS_DLQ_NAME: 'wager-transactions-dlq.fifo',
   WAGER_TRANSACTIONS_QUEUE_NAME: 'wager-transactions.fifo',
 } as const;
@@ -25,6 +26,10 @@ test('parses and normalizes a valid application environment', () => {
     SQS_MAX_RECEIVE_COUNT: 5,
     SQS_VISIBILITY_TIMEOUT_SECONDS: 30,
     SQS_MAX_RETRY_VISIBILITY_SECONDS: 300,
+    OUTBOX_BATCH_SIZE: 10,
+    OUTBOX_POLL_INTERVAL_MS: 1_000,
+    OUTBOX_RETRY_BASE_SECONDS: 5,
+    OUTBOX_RETRY_MAX_SECONDS: 300,
   });
 });
 
@@ -42,6 +47,16 @@ test('rejects a retry visibility cap below the base visibility timeout', () => {
     ...validEnvironment,
     SQS_VISIBILITY_TIMEOUT_SECONDS: '30',
     SQS_MAX_RETRY_VISIBILITY_SECONDS: '10',
+  });
+
+  expect(result.success).toBeFalse();
+});
+
+test('rejects an outbox retry cap below its base delay', () => {
+  const result = environmentSchema.safeParse({
+    ...validEnvironment,
+    OUTBOX_RETRY_BASE_SECONDS: '30',
+    OUTBOX_RETRY_MAX_SECONDS: '10',
   });
 
   expect(result.success).toBeFalse();

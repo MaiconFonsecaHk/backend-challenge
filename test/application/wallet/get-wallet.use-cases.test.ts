@@ -100,6 +100,7 @@ function queryContext(options: {
     },
     outboxMessages: {
       findById: async () => undefined,
+      findDueForUpdate: async () => [],
       add: async () => undefined,
       save: async () => undefined,
     },

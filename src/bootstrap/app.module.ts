@@ -6,6 +6,7 @@ import { PersistenceModule } from '../infrastructure/persistence/persistence.mod
 import { HealthModule } from '../interfaces/health/health.module.js';
 import { HttpApiModule } from './http-api.module.js';
 import { SqsWagerConsumerModule } from './sqs-wager-consumer.module.js';
+import { OutboxPublisherModule } from './outbox-publisher.module.js';
 
 @Module({
   imports: [
@@ -18,6 +19,7 @@ import { SqsWagerConsumerModule } from './sqs-wager-consumer.module.js';
     PersistenceModule,
     HttpApiModule,
     SqsWagerConsumerModule,
+    OutboxPublisherModule,
     HealthModule,
   ],
 })

@@ -50,13 +50,17 @@ AppModule
 │   ├── SqsWagerConsumer ── long polling, ack, retry e DLQ
 │   ├── SqsWagerMessageHandler ── contrato SQS → use case compartilhado
 │   └── ProcessWagerTransactionUseCase ── inbox + efeitos + outbox atômicos
+├── OutboxPublisherModule
+│   ├── OutboxPublisherWorker ── polling e shutdown cooperativo
+│   ├── PublishOutboxBatchUseCase ── claim + publicação + retry transacionais
+│   └── SqsOutboxEventTransport ── integration-events.fifo
 └── HealthModule
     ├── GET /health/live
     ├── PostgreSQL health indicator ── MikroORM ── SELECT 1
     └── SQS health indicator ── AWS SDK v3 ── MiniStack/SQS
 ```
 
-Os endpoints financeiros e de consulta e o consumidor SQS expõem o mesmo caso de uso de wagering por bordas validadas; publisher da outbox e worker de referências ainda não existem. O domínio puro da Fase 2 contém `Money`, `Wallet`, `WagerTransaction`, `WalletLedgerEntry`, os modelos de inbox/outbox e os eventos de integração. A infraestrutura materializa os cinco modelos persistentes com constraints, índices, mappers, repositórios e Unit of Work transacional. A aplicação possui os casos de uso de criação, consulta e reconciliação de wallet, consulta paginada do ledger e uma entrada única e independente de transporte para submissões de wagering. Essa entrada normaliza o comando, calcula seu hash canônico e passa por um processador de idempotência persistente que serializa operações de saldo por wallet e executa inbox e efeitos financeiros com outbox na mesma transação SQL.
+Os endpoints financeiros e de consulta e o consumidor SQS expõem o mesmo caso de uso de wagering por bordas validadas. O publisher da outbox reivindica eventos confirmados no PostgreSQL e os publica em uma fila FIFO dedicada; somente o worker de referências pendentes ainda não existe. O domínio puro da Fase 2 contém `Money`, `Wallet`, `WagerTransaction`, `WalletLedgerEntry`, os modelos de inbox/outbox e os eventos de integração. A infraestrutura materializa os cinco modelos persistentes com constraints, índices, mappers, repositórios e Unit of Work transacional. A aplicação possui os casos de uso de criação, consulta e reconciliação de wallet, consulta paginada do ledger e uma entrada única e independente de transporte para submissões de wagering. Essa entrada normaliza o comando, calcula seu hash canônico e passa por um processador de idempotência persistente que serializa operações de saldo por wallet e executa inbox e efeitos financeiros com outbox na mesma transação SQL.
 
 ## 4. Boundaries e dependências
 
@@ -397,6 +401,18 @@ O baseline permanece neutro e prova a cadeia inicial. A migration seguinte cont�
 - **Evidência:** testes unitários provam ack posterior ao handler, paralelismo entre grupos, ordem dentro do grupo, backoff, exaustão sem ack, envio à DLQ antes da remoção e validação dos limites. Testes com SQS real em container comprovam redelivery após falha de ack, DLQ imediata para falha permanente e redrive nativa após duas tentativas transitórias em filas isoladas de teste. O script de bootstrap cria fila FIFO, DLQ FIFO e redrive policy reproduzível.
 - **Limitação e gatilho de revisão:** logs estruturados e métricas de retry/DLQ pertencem à Fase 9. O shutdown cooperativo não elimina redelivery em `SIGKILL`, perda do host ou expiração de visibilidade; a inbox torna essas reentregas seguras.
 
+### D-032 — Publishers reivindicam a outbox com locks transacionais independentes
+
+- **Status:** confirmada para publicação concorrente e recuperação por retry.
+- **Requisito protegido:** nenhum evento confirmado pode ser perdido, publishers concorrentes não podem reivindicar a mesma linha simultaneamente e eventos posteriores do mesmo aggregate não podem ultrapassar um predecessor aguardando retry.
+- **Alternativas consideradas:** publicar antes do commit financeiro foi rejeitado porque permitiria eventos sobre efeitos revertidos; polling sem lock foi rejeitado por permitir publicação concorrente da mesma linha; colunas de lease foram consideradas, mas adiadas porque acrescentariam schema, autoridade de tempo e recuperação de leases expirados sem necessidade demonstrada. Locks mantidos durante o envio foram escolhidos por oferecer recuperação automática no rollback com o modelo atual.
+- **Escolha:** cada lote abre uma transação PostgreSQL e seleciona somente eventos não publicados e vencidos com `FOR UPDATE SKIP LOCKED`. Apenas o evento pendente mais antigo por `aggregateId` é elegível. Publishers diferentes prosseguem sobre linhas distintas; a fila usa `aggregateId` como `MessageGroupId` e o id do evento como `MessageDeduplicationId`. Sucesso marca `publishedAt` e falha agenda retry exponencial dentro da mesma transação que possui o lock.
+- **Recuperação:** morte antes do envio causa rollback e libera a linha para outra instância. Morte depois do envio e antes da marcação pode republicar o evento; essa duplicidade é intencionalmente aceita no modelo at-least-once, e o id estável permite idempotência no consumidor. Falhas continuam sendo tentadas com atraso limitado pelo teto configurado, em vez de descartar um evento financeiro confirmado após um número arbitrário de tentativas.
+- **Limites e justificativa:** os defaults são lote de 10, polling a cada 1 segundo e backoff de 5 a 300 segundos. O lote pequeno limita locks e tempo de transação enquanto ainda permite vazão paralela; os valores são externos e devem ser revistos com p99 de publicação, contenção e outbox lag observados.
+- **Trade-off:** manter a transação aberta durante a chamada de rede simplifica claim e recuperação, mas ocupa conexão e locks enquanto o SQS responde. Se latência ou volume tornarem isso material, leases explícitos passam a ser a alternativa a medir, preservando ordenação por aggregate e recuperação de crash.
+- **Evidência:** duas instâncias independentes de ORM e publisher dividem seis aggregates no PostgreSQL real sem sobreposição; outro teste impede um evento posterior de ultrapassar o predecessor em retry. A integração SQS confirma envelope, grupo e deduplicação, e a aplicação real publica o evento criado por uma wallet somente depois do commit. Testes do worker comprovam drenagem do lote iniciado e interrupção da espera no shutdown.
+- **Limitação e gatilho de revisão:** duplicidade ainda é possível na janela envio/marcação e deve ser tolerada por consumidores. Logs, métricas e alerta de lag pertencem à Fase 9; o emulador local não substitui validação periódica na AWS real.
+
 ## 6. Decisões abertas
 
 Nenhuma alternativa desta tabela está escolhida antecipadamente.
@@ -404,9 +420,8 @@ Nenhuma alternativa desta tabela está escolhida antecipadamente.
 | Decisão | Requisito protegido | Alternativas que precisam ser avaliadas | Evidência necessária para fechar |
 | --- | --- | --- | --- |
 | Limite transacional dos casos de uso | atomicidade de wallet, ledger, transação, inbox e outbox | composição de cada operação financeira dentro do Unit of Work já comprovado | testes de falha antes/depois do commit e concorrência para cada caso de uso |
-| Outbox | nenhum evento confirmado perdido | claim concorrente, leasing/locking e marcação de publicação | crash após commit, dois publishers e publicação duplicada |
 | Referência pendente | processar mensagens fora de ordem sem perda | TTL ou máximo de tentativas ainda não definidos | referência posterior, expiração e rejeição terminal auditável |
-| Shutdown do publisher e worker de referências | não perder trabalho em andamento | drenagem, extensão/devolução de leases e ordem de encerramento | `SIGTERM` durante publicação e recuperação de referências |
+| Shutdown do worker de referências | não perder trabalho em andamento | drenagem, extensão/devolução de leases e ordem de encerramento | `SIGTERM` durante recuperação de referências |
 | Observabilidade | diagnosticar rejeições, retries, DLQ e divergências | formato de logs, correlação e métricas ainda não definidos | testes que confirmem sinais úteis sem expor dados sensíveis |
 
 ## 7. Modelo transacional — estado atual
@@ -445,13 +460,13 @@ bun run migration:up
 bun run migration:down
 ```
 
-O ciclo `up → inspeção → down → inspeção → up` é automatizado em um banco temporário criado por execução. A suíte PostgreSQL comprova round-trip exato dos cinco modelos, commit e rollback incluindo inbox, constraints representativas, imutabilidade do ledger, paginação estável, reconciliação, disputa financeira real e cinquenta submissões concorrentes. A suíte SQS cria filas temporárias no emulador real e comprova redelivery após falha de ack, DLQ permanente e redrive transitória. A suíte normal também comprova o runner do Bun, configuração, domínio, contratos, agrupamento concorrente e decisões de retry sem substituir essas provas de infraestrutura.
+O ciclo `up → inspeção → down → inspeção → up` é automatizado em um banco temporário criado por execução. A suíte PostgreSQL comprova round-trip exato dos cinco modelos, commit e rollback incluindo inbox, constraints representativas, imutabilidade do ledger, paginação estável, reconciliação, disputa financeira real, cinquenta submissões concorrentes e dois publishers dividindo a outbox sem sobreposição nem quebra de ordem por aggregate. A suíte SQS cria filas temporárias no emulador real e comprova redelivery após falha de ack, DLQ permanente, redrive transitória e publicação da outbox com grupo e deduplicação estáveis. A suíte normal também comprova o runner do Bun, configuração, domínio, contratos, agrupamento concorrente e decisões de retry sem substituir essas provas de infraestrutura.
 
 ## 10. Limitações atuais
 
 - endpoints de wallet, ledger, reconciliação e wagering estão implementados com contratos estritos e taxonomia HTTP estável;
-- o consumer SQS e a inbox atômica estão implementados; publisher da outbox e worker de referências pendentes ainda não existem;
-- outbox possui domínio e persistência transacional, mas ainda não possui publicação, claim concorrente ou recuperação operacional;
+- o consumer SQS, a inbox atômica e o publisher concorrente da outbox estão implementados; o worker de referências pendentes ainda não existe;
+- a outbox publica com claim transacional e retry sem descartar eventos; duplicidade continua possível na janela entre envio ao SQS e marcação no PostgreSQL;
 - concorrência por wallet, idempotência HTTP e deduplicação SQS estão implementadas; a autorização da identidade do provider ainda não;
 - existem testes reais de PostgreSQL, SQS, concorrência financeira e redelivery commit/ack; crash abrupto de processo e três processos completos permanecem na Fase 10;
 - não existem autenticação, logs estruturados ou métricas de negócio;

@@ -88,6 +88,7 @@ export interface InboxMessageRepository {
 
 export interface OutboxMessageRepository {
   findById(id: string): Promise<OutboxMessage | undefined>;
+  findDueForUpdate(now: Date, limit: number): Promise<readonly OutboxMessage[]>;
   add(message: OutboxMessage): Promise<void>;
   save(message: OutboxMessage): Promise<void>;
 }

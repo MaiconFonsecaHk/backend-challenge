@@ -9,6 +9,10 @@ import {
 import type { Clock } from '../../../src/application/ports/clock.js';
 import type { IdGenerator } from '../../../src/application/ports/id-generator.js';
 import type {
+  OutboxEventPublication,
+  OutboxEventTransport,
+} from '../../../src/application/ports/outbox-event-transport.js';
+import type {
   PersistenceRepositories,
   WagerTransactionRecord,
 } from '../../../src/application/ports/persistence/repositories.js';
@@ -17,6 +21,7 @@ import type {
   WagerTransactionProcessingCommand,
 } from '../../../src/application/ports/wager-transaction-processor.js';
 import { PersistentWagerTransactionProcessor } from '../../../src/application/services/persistent-wager-transaction.processor.js';
+import { ExponentialOutboxRetryPolicy } from '../../../src/application/services/exponential-outbox-retry.policy.js';
 import { WagerPayloadFingerprintService } from '../../../src/application/services/wager-payload-fingerprint.js';
 import { WagerTransactionExecutor } from '../../../src/application/services/wager-transaction.executor.js';
 import {
@@ -24,6 +29,7 @@ import {
   GetWagerTransactionByIdUseCase,
 } from '../../../src/application/use-cases/wagering/get-wager-transaction.use-cases.js';
 import { ProcessWagerTransactionUseCase } from '../../../src/application/use-cases/wagering/process-wager-transaction.use-case.js';
+import { PublishOutboxBatchUseCase } from '../../../src/application/use-cases/messaging/publish-outbox-batch.use-case.js';
 import { CreateWalletUseCase } from '../../../src/application/use-cases/wallet/create-wallet.use-case.js';
 import { GetWalletLedgerUseCase } from '../../../src/application/use-cases/wallet/get-wallet-ledger.use-case.js';
 import { GetWalletUseCase } from '../../../src/application/use-cases/wallet/get-wallet.use-case.js';
@@ -167,6 +173,43 @@ class ConcurrentLossExecutor implements NewWagerTransactionExecutor {
       resultBalance: wallet.balance,
       referenceAttempts: 0,
     };
+  }
+}
+
+class PublicationBarrier {
+  private arrivals = 0;
+  private readonly ready: Promise<void>;
+  private release?: () => void;
+
+  constructor(private readonly expectedArrivals: number) {
+    this.ready = new Promise((resolve) => {
+      this.release = resolve;
+    });
+  }
+
+  async arrive(): Promise<void> {
+    this.arrivals += 1;
+    if (this.arrivals === this.expectedArrivals) {
+      this.release?.();
+    }
+    await this.ready;
+  }
+}
+
+class BarrierOutboxTransport implements OutboxEventTransport {
+  private firstPublication = true;
+
+  constructor(
+    private readonly barrier: PublicationBarrier,
+    private readonly publications: OutboxEventPublication[],
+  ) {}
+
+  async publish(event: OutboxEventPublication): Promise<void> {
+    this.publications.push(event);
+    if (this.firstPublication) {
+      this.firstPublication = false;
+      await this.barrier.arrive();
+    }
   }
 }
 
@@ -476,6 +519,266 @@ describePostgreSql('PostgreSQL schema integration', () => {
       'Migration20261008023045_add_access_pattern_indexes',
     ]);
     expect(await applicationTableNames()).toEqual([...APPLICATION_TABLES]);
+  });
+
+  test('publishes one claimed outbox batch per concurrent instance without overlap', async () => {
+    const eventIds = Array.from(
+      { length: 6 },
+      (_, index) =>
+        `50000000-0000-4000-8000-${String(901 + index).padStart(12, '0')}`,
+    );
+    await new MikroOrmUnitOfWork(requiredApplicationOrm()).execute(
+      async (repositories) => {
+        for (const [index, eventId] of eventIds.entries()) {
+          await repositories.outboxMessages.add(
+            OutboxMessage.rehydrate({
+              id: eventId,
+              aggregateId: `10000000-0000-4000-8000-${String(901 + index).padStart(12, '0')}`,
+              eventType: 'OutboxConcurrencyProbe',
+              payload: {
+                eventId,
+                eventType: 'OutboxConcurrencyProbe',
+                aggregateId: `10000000-0000-4000-8000-${String(901 + index).padStart(12, '0')}`,
+                correlationId: `outbox-concurrency-${index}`,
+                occurredAt: CREATED_AT.toISOString(),
+                version: 1,
+                data: { sequence: index },
+              },
+              occurredAt: CREATED_AT,
+              attempts: 0,
+            }),
+          );
+        }
+      },
+    );
+
+    const independentQueryLog: string[] = [];
+    const instances = await Promise.all(
+      Array.from({ length: 2 }, () =>
+        createIndependentApplicationOrm(independentQueryLog),
+      ),
+    );
+    const publications: OutboxEventPublication[] = [];
+    const barrier = new PublicationBarrier(2);
+    try {
+      const publishers = instances.map(
+        (orm) =>
+          new PublishOutboxBatchUseCase(
+            new MikroOrmUnitOfWork(orm),
+            new BarrierOutboxTransport(barrier, publications),
+            new FixedClock(PROCESSED_AT),
+            new ExponentialOutboxRetryPolicy(5, 300),
+          ),
+      );
+
+      const results = await Promise.all(
+        publishers.map((publisher) => publisher.execute(3)),
+      );
+
+      expect(results).toEqual([
+        { claimed: 3, published: 3, failed: 0 },
+        { claimed: 3, published: 3, failed: 0 },
+      ]);
+      expect(publications).toHaveLength(6);
+      expect(new Set(publications.map((event) => event.id))).toEqual(
+        new Set(eventIds),
+      );
+      expect(
+        independentQueryLog.some((query) =>
+          query.toLowerCase().includes('for update') &&
+          query.toLowerCase().includes('skip locked'),
+        ),
+      ).toBeTrue();
+    } finally {
+      await Promise.all(instances.map((orm) => orm.close(true)));
+    }
+
+    const publishedRows = await requiredApplicationOrm().em
+      .getConnection()
+      .execute<Array<{ attempts: number; id: string; published_at: Date | null }>>(
+        `select id, attempts, published_at
+           from outbox_messages
+          where event_type = 'OutboxConcurrencyProbe'
+          order by id`,
+      );
+    expect(publishedRows.map((row) => row.id)).toEqual(eventIds);
+    expect(publishedRows.every((row) => row.attempts === 0)).toBeTrue();
+    expect(publishedRows.every((row) => row.published_at !== null)).toBeTrue();
+  });
+
+  test('does not publish a later aggregate event while its predecessor is waiting for retry', async () => {
+    const blockedAggregateId = '10000000-0000-4000-8000-000000000920';
+    const earlierEventId = '50000000-0000-4000-8000-000000000920';
+    const laterEventId = '50000000-0000-4000-8000-000000000921';
+    const independentEventId = '50000000-0000-4000-8000-000000000922';
+    const laterOccurredAt = new Date('2026-10-08T12:00:30.000Z');
+    const retryAt = new Date('2026-10-08T13:00:00.000Z');
+    const unitOfWork = new MikroOrmUnitOfWork(requiredApplicationOrm());
+    await unitOfWork.execute(async (repositories) => {
+      for (const message of [
+        OutboxMessage.rehydrate({
+          id: earlierEventId,
+          aggregateId: blockedAggregateId,
+          eventType: 'OutboxOrderingProbe',
+          payload: { eventId: earlierEventId },
+          occurredAt: CREATED_AT,
+          attempts: 1,
+          nextAttemptAt: retryAt,
+        }),
+        OutboxMessage.rehydrate({
+          id: laterEventId,
+          aggregateId: blockedAggregateId,
+          eventType: 'OutboxOrderingProbe',
+          payload: { eventId: laterEventId },
+          occurredAt: laterOccurredAt,
+          attempts: 0,
+        }),
+        OutboxMessage.rehydrate({
+          id: independentEventId,
+          aggregateId: '10000000-0000-4000-8000-000000000922',
+          eventType: 'OutboxOrderingProbe',
+          payload: { eventId: independentEventId },
+          occurredAt: CREATED_AT,
+          attempts: 0,
+        }),
+      ]) {
+        await repositories.outboxMessages.add(message);
+      }
+    });
+    const publications: OutboxEventPublication[] = [];
+    const transport: OutboxEventTransport = {
+      publish: async (event) => {
+        publications.push(event);
+      },
+    };
+    const publisher = new PublishOutboxBatchUseCase(
+      unitOfWork,
+      transport,
+      new FixedClock(PROCESSED_AT),
+      new ExponentialOutboxRetryPolicy(5, 300),
+    );
+
+    expect(await publisher.execute(10)).toEqual({
+      claimed: 1,
+      published: 1,
+      failed: 0,
+    });
+    expect(publications.map((event) => event.id)).toEqual([
+      independentEventId,
+    ]);
+    const rows = await requiredApplicationOrm().em
+      .getConnection()
+      .execute<Array<{ id: string; published_at: Date | null }>>(
+        `select id, published_at
+           from outbox_messages
+          where event_type = 'OutboxOrderingProbe'
+          order by id`,
+      );
+    expect(
+      rows.map((row) => ({
+        id: row.id,
+        published: row.published_at !== null,
+      })),
+    ).toEqual([
+      { id: earlierEventId, published: false },
+      { id: laterEventId, published: false },
+      { id: independentEventId, published: true },
+    ]);
+  });
+
+  test('persists a failed publication retry and recovers when it becomes due', async () => {
+    const eventId = '50000000-0000-4000-8000-000000000930';
+    const unitOfWork = new MikroOrmUnitOfWork(requiredApplicationOrm());
+    await unitOfWork.execute(async (repositories) => {
+      await repositories.outboxMessages.add(
+        OutboxMessage.rehydrate({
+          id: eventId,
+          aggregateId: '10000000-0000-4000-8000-000000000930',
+          eventType: 'OutboxRetryProbe',
+          payload: { eventId },
+          occurredAt: CREATED_AT,
+          attempts: 0,
+        }),
+      );
+    });
+
+    const retryPolicy = new ExponentialOutboxRetryPolicy(5, 300);
+    const failingPublisher = new PublishOutboxBatchUseCase(
+      unitOfWork,
+      {
+        publish: async () => {
+          throw new Error('temporary transport failure');
+        },
+      },
+      new FixedClock(PROCESSED_AT),
+      retryPolicy,
+    );
+
+    expect(await failingPublisher.execute(10)).toEqual({
+      claimed: 1,
+      published: 0,
+      failed: 1,
+    });
+
+    const [retryRow] = await requiredApplicationOrm().em
+      .getConnection()
+      .execute<
+        Array<{
+          attempts: number;
+          next_attempt_at: Date | string;
+          published_at: Date | string | null;
+        }>
+      >(
+        `select attempts, next_attempt_at, published_at
+           from outbox_messages
+          where id = ?`,
+        [eventId],
+      );
+    expect(retryRow?.attempts).toBe(1);
+    expect(new Date(retryRow!.next_attempt_at).toISOString()).toBe(
+      '2026-10-08T12:01:05.000Z',
+    );
+    expect(retryRow?.published_at).toBeNull();
+
+    const publications: OutboxEventPublication[] = [];
+    const successfulTransport: OutboxEventTransport = {
+      publish: async (event) => {
+        publications.push(event);
+      },
+    };
+    const notYetDuePublisher = new PublishOutboxBatchUseCase(
+      unitOfWork,
+      successfulTransport,
+      new FixedClock(new Date('2026-10-08T12:01:04.000Z')),
+      retryPolicy,
+    );
+    expect(await notYetDuePublisher.execute(10)).toEqual({
+      claimed: 0,
+      published: 0,
+      failed: 0,
+    });
+
+    const recoveredPublisher = new PublishOutboxBatchUseCase(
+      unitOfWork,
+      successfulTransport,
+      new FixedClock(new Date('2026-10-08T12:01:05.000Z')),
+      retryPolicy,
+    );
+    expect(await recoveredPublisher.execute(10)).toEqual({
+      claimed: 1,
+      published: 1,
+      failed: 0,
+    });
+    expect(publications.map((event) => event.id)).toEqual([eventId]);
+
+    const publishedMessage = await unitOfWork.execute((repositories) =>
+      repositories.outboxMessages.findById(eventId),
+    );
+    expect(publishedMessage?.attempts).toBe(1);
+    expect(publishedMessage?.nextAttemptAt).toBeUndefined();
+    expect(publishedMessage?.publishedAt?.toISOString()).toBe(
+      '2026-10-08T12:01:05.000Z',
+    );
   });
 
   test('commits and rehydrates a complete opening without monetary precision loss', async () => {

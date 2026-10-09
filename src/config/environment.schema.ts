@@ -20,6 +20,7 @@ const sqsEnvironmentSchema = z.object({
   SQS_ENDPOINT: z.url().optional(),
   WAGER_TRANSACTIONS_QUEUE_NAME: z.string().trim().endsWith('.fifo'),
   WAGER_TRANSACTIONS_DLQ_NAME: z.string().trim().endsWith('.fifo'),
+  INTEGRATION_EVENTS_QUEUE_NAME: z.string().trim().endsWith('.fifo'),
   SQS_MAX_RECEIVE_COUNT: z.coerce.number().int().min(2).default(5),
   SQS_VISIBILITY_TIMEOUT_SECONDS: z.coerce
     .number()
@@ -28,6 +29,25 @@ const sqsEnvironmentSchema = z.object({
     .max(43_200)
     .default(30),
   SQS_MAX_RETRY_VISIBILITY_SECONDS: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .max(43_200)
+    .default(300),
+  OUTBOX_BATCH_SIZE: z.coerce.number().int().min(1).max(100).default(10),
+  OUTBOX_POLL_INTERVAL_MS: z.coerce
+    .number()
+    .int()
+    .min(50)
+    .max(60_000)
+    .default(1_000),
+  OUTBOX_RETRY_BASE_SECONDS: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .max(3_600)
+    .default(5),
+  OUTBOX_RETRY_MAX_SECONDS: z.coerce
     .number()
     .int()
     .min(1)
@@ -60,6 +80,18 @@ export const environmentSchema = runtimeEnvironmentSchema
         message:
           'SQS_MAX_RETRY_VISIBILITY_SECONDS must be greater than or equal to SQS_VISIBILITY_TIMEOUT_SECONDS',
         path: ['SQS_MAX_RETRY_VISIBILITY_SECONDS'],
+      });
+    }
+
+    if (
+      environment.OUTBOX_RETRY_MAX_SECONDS <
+      environment.OUTBOX_RETRY_BASE_SECONDS
+    ) {
+      context.addIssue({
+        code: 'custom',
+        message:
+          'OUTBOX_RETRY_MAX_SECONDS must be greater than or equal to OUTBOX_RETRY_BASE_SECONDS',
+        path: ['OUTBOX_RETRY_MAX_SECONDS'],
       });
     }
   });

@@ -34,3 +34,8 @@ attributes="$(printf \
 aws --endpoint-url="$endpoint_url" --region="$region" sqs set-queue-attributes \
   --queue-url "$queue_url" \
   --attributes "$attributes"
+
+aws --endpoint-url="$endpoint_url" --region="$region" sqs create-queue \
+  --queue-name integration-events.fifo \
+  --attributes FifoQueue=true \
+  >/dev/null

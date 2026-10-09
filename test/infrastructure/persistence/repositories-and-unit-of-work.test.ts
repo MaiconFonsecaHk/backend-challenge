@@ -52,16 +52,23 @@ interface EntityManagerDouble {
   }>;
   readonly persisted: object[];
   readonly assignments: Array<{ entity: object; data: object }>;
+  readonly executeCalls: Array<{
+    query: string;
+    params: readonly unknown[];
+    method: string;
+  }>;
 }
 
 function entityManagerDouble(
   findOneResult: object | null,
   findResult: object[] = [],
+  executeResult: object[] = [],
 ): EntityManagerDouble {
   const findOneCalls: EntityManagerDouble['findOneCalls'] = [];
   const findCalls: EntityManagerDouble['findCalls'] = [];
   const persisted: object[] = [];
   const assignments: EntityManagerDouble['assignments'] = [];
+  const executeCalls: EntityManagerDouble['executeCalls'] = [];
 
   const entityManager = {
     async findOne(
@@ -80,6 +87,14 @@ function entityManagerDouble(
       findCalls.push({ entityType, where, options });
       return findResult;
     },
+    async execute(
+      query: string,
+      params: readonly unknown[],
+      method: string,
+    ) {
+      executeCalls.push({ query, params, method });
+      return executeResult;
+    },
     create(
       entityType: new (...args: never[]) => object,
       data: object,
@@ -95,7 +110,14 @@ function entityManagerDouble(
     },
   } as unknown as EntityManager;
 
-  return { entityManager, findOneCalls, findCalls, persisted, assignments };
+  return {
+    entityManager,
+    findOneCalls,
+    findCalls,
+    persisted,
+    assignments,
+    executeCalls,
+  };
 }
 
 function brl(amount: string): Money {
@@ -326,12 +348,15 @@ describe('MikroORM repositories', () => {
       new OutboxMessagePersistenceEntity(),
       OutboxMessagePersistenceMapper.toPersistence(outbox),
     );
-    const outboxDouble = entityManagerDouble(outboxEntity);
+    const outboxDouble = entityManagerDouble(outboxEntity, [], [
+      OutboxMessagePersistenceMapper.toPersistence(outbox),
+    ]);
     const outboxRepository = new MikroOrmOutboxMessageRepository(
       outboxDouble.entityManager,
     );
 
     await outboxRepository.findById(outbox.id);
+    expect(await outboxRepository.findDueForUpdate(UPDATED_AT, 10)).toHaveLength(1);
     await outboxRepository.add(outbox);
     outbox.markPublished(UPDATED_AT);
     await outboxRepository.save(outbox);
@@ -350,6 +375,12 @@ describe('MikroORM repositories', () => {
       nextAttemptAt: null,
       publishedAt: UPDATED_AT,
     });
+    expect(outboxDouble.executeCalls[0]?.query).toContain(
+      'for update of candidate skip locked',
+    );
+    expect(outboxDouble.executeCalls[0]?.query).toContain('not exists');
+    expect(outboxDouble.executeCalls[0]?.params).toEqual([UPDATED_AT, 10]);
+    expect(outboxDouble.executeCalls[0]?.method).toBe('all');
   });
 
   test('reconciles wallet and ledger from one exact aggregate query', async () => {
