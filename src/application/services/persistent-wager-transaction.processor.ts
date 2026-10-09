@@ -1,6 +1,7 @@
 import {
   IdempotencyConflictError,
   InboxPayloadConflictError,
+  ProviderTransactionConflictError,
 } from '../errors/wager-application.error.js';
 import { WalletNotFoundError } from '../errors/wallet-application.error.js';
 import type { PersistenceConflictClassifier } from '../ports/persistence/persistence-conflict-classifier.js';
@@ -48,24 +49,35 @@ export class PersistentWagerTransactionProcessor
       if (this.conflictClassifier.isLockConflict(error)) {
         this.metrics.recordLockConflict(command.kind);
       }
-      const recoverableConflict =
-        this.conflictClassifier.isWagerIdempotencyKeyConflict(error) ||
+      const idempotencyConflict =
+        this.conflictClassifier.isWagerIdempotencyKeyConflict(error);
+      const providerTransactionConflict =
+        this.conflictClassifier.isWagerProviderTransactionConflict(error);
+      const inboxConflict =
         this.conflictClassifier.isInboxIdentityConflict(error);
+      const recoverableConflict =
+        idempotencyConflict || providerTransactionConflict || inboxConflict;
       if (!recoverableConflict) {
         throw error;
       }
 
       return this.unitOfWork.execute(async (repositories) => {
         const inbox = await this.prepareInbox(command, repositories);
-        const winner =
-          await repositories.wagerTransactions.findByIdempotencyKey(
-            command.idempotencyKey,
-          );
+        const winner = providerTransactionConflict
+          ? await repositories.wagerTransactions.findByProviderTransaction(
+              command.providerId,
+              command.externalTransactionId,
+            )
+          : await repositories.wagerTransactions.findByIdempotencyKey(
+              command.idempotencyKey,
+            );
         if (winner === undefined) {
           throw error;
         }
 
-        const result = this.resolveExisting(winner, command);
+        const result = providerTransactionConflict
+          ? this.resolveProviderTransactionConflict(winner, command)
+          : this.resolveExisting(winner, command);
         await this.completeInbox(inbox, repositories);
         return result;
       });
@@ -171,6 +183,20 @@ export class PersistentWagerTransactionProcessor
     }
 
     return PersistentWagerTransactionProcessor.toResult(record, true);
+  }
+
+  private resolveProviderTransactionConflict(
+    record: WagerTransactionRecord,
+    command: WagerTransactionProcessingCommand,
+  ): ProcessWagerTransactionResult {
+    if (record.transaction.idempotencyKey !== command.idempotencyKey) {
+      throw new ProviderTransactionConflictError(
+        command.providerId,
+        command.externalTransactionId,
+      );
+    }
+
+    return this.resolveExisting(record, command);
   }
 
   private static toResult(

@@ -26,6 +26,16 @@ export class IdempotencyConflictError extends ApplicationError {
   }
 }
 
+export class ProviderTransactionConflictError extends ApplicationError {
+  readonly code = 'PROVIDER_TRANSACTION_CONFLICT';
+
+  constructor(providerId: string, externalTransactionId: string) {
+    super(
+      `Provider transaction ${providerId}:${externalTransactionId} was already submitted with another idempotency key.`,
+    );
+  }
+}
+
 export class WagerTransactionNotFoundError extends ApplicationError {
   readonly code = 'WAGER_TRANSACTION_NOT_FOUND';
 

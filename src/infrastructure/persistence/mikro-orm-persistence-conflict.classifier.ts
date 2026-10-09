@@ -10,6 +10,8 @@ import type { WalletPersistenceConflictClassifier } from '../../application/port
 const WALLET_IDENTITY_CONSTRAINT = 'wallets_player_id_currency_unique';
 const WAGER_IDEMPOTENCY_CONSTRAINT =
   'wager_transactions_idempotency_key_unique';
+const WAGER_PROVIDER_TRANSACTION_CONSTRAINT =
+  'wager_transactions_provider_external_unique';
 const INBOX_IDENTITY_CONSTRAINT = 'inbox_messages_pkey';
 
 interface ConstraintError {
@@ -32,6 +34,14 @@ export class MikroOrmPersistenceConflictClassifier
     return (
       error instanceof UniqueConstraintViolationException &&
       (error as ConstraintError).constraint === WAGER_IDEMPOTENCY_CONSTRAINT
+    );
+  }
+
+  isWagerProviderTransactionConflict(error: unknown): boolean {
+    return (
+      error instanceof UniqueConstraintViolationException &&
+      (error as ConstraintError).constraint ===
+        WAGER_PROVIDER_TRANSACTION_CONSTRAINT
     );
   }
 

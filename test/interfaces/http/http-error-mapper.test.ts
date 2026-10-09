@@ -9,6 +9,7 @@ import { BadRequestException, HttpStatus, NotFoundException } from '@nestjs/comm
 import {
   IdempotencyConflictError,
   InvalidWagerCommandError,
+  ProviderTransactionConflictError,
   WagerTransactionNotFoundError,
 } from '../../../src/application/errors/wager-application.error.js';
 import {
@@ -29,6 +30,10 @@ describe('HTTP error mapping', () => {
       HttpStatus.CONFLICT,
     ],
     [new IdempotencyConflictError('key'), HttpStatus.CONFLICT],
+    [
+      new ProviderTransactionConflictError('provider-a', 'external-1'),
+      HttpStatus.CONFLICT,
+    ],
   ])('maps %s to its public status and stable code', (error, status) => {
     const mapped = mapHttpError(error);
 

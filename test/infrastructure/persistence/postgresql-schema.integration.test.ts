@@ -5,6 +5,7 @@ import { MikroORM } from '@mikro-orm/postgresql';
 import {
   IdempotencyConflictError,
   InboxPayloadConflictError,
+  ProviderTransactionConflictError,
 } from '../../../src/application/errors/wager-application.error.js';
 import type { Clock } from '../../../src/application/ports/clock.js';
 import type { IdGenerator } from '../../../src/application/ports/id-generator.js';
@@ -125,7 +126,10 @@ class ConcurrentLossExecutor implements NewWagerTransactionExecutor {
   private readonly barrier: Promise<void>;
   private releaseBarrier: (() => void) | undefined;
 
-  constructor(private readonly barrierSize: number) {
+  constructor(
+    private readonly barrierSize: number,
+    private readonly eventType = 'IdempotencyProbeProcessed',
+  ) {
     this.barrier = new Promise((resolve) => {
       this.releaseBarrier = resolve;
     });
@@ -167,7 +171,7 @@ class ConcurrentLossExecutor implements NewWagerTransactionExecutor {
       OutboxMessage.rehydrate({
         id: eventId,
         aggregateId: transaction.id,
-        eventType: 'IdempotencyProbeProcessed',
+        eventType: this.eventType,
         payload: {
           eventId,
           transactionId: transaction.id,
@@ -2125,6 +2129,103 @@ describePostgreSql('PostgreSQL schema integration', () => {
       difference: { amount: '0.00', currency: 'BRL' },
       consistent: true,
       checkedEntries: 2,
+    });
+  });
+
+  test('returns one 409 conflict when provider identity races under different idempotency keys', async () => {
+    const walletId = '10000000-0000-4000-8000-000000000118';
+    const playerId = '20000000-0000-4000-8000-000000000118';
+    const providerId = 'provider-external-conflict';
+    const externalTransactionId = 'external-conflict-118';
+    const unitOfWork = new MikroOrmUnitOfWork(requiredApplicationOrm());
+    await createWalletUseCase(
+      unitOfWork,
+      new SequenceIdGenerator([walletId]),
+      new FixedClock(CREATED_AT),
+    ).execute({
+      playerId,
+      initialBalance: { amount: '0.00', currency: 'BRL' },
+      correlationId: 'wallet-create-integration-118',
+    });
+
+    const executor = new ConcurrentLossExecutor(
+      2,
+      'ProviderIdentityProbeProcessed',
+    );
+    const useCase = new ProcessWagerTransactionUseCase(
+      new PersistentWagerTransactionProcessor(
+        unitOfWork,
+        executor,
+        new MikroOrmPersistenceConflictClassifier(),
+      ),
+      new WagerPayloadFingerprintService(new Sha256PayloadDigest()),
+    );
+    const submission = {
+      providerId,
+      externalTransactionId,
+      playerId,
+      walletId,
+      roundId: 'round-provider-conflict-118',
+      gameId: 'game-provider-conflict-118',
+      kind: WagerTransactionKind.Loss,
+      money: { amount: '10.00', currency: 'BRL' },
+    } as const;
+
+    const results = await Promise.allSettled([
+      useCase.execute({
+        ...submission,
+        idempotencyKey: 'provider-conflict-key-a',
+        correlationId: 'provider-conflict-correlation-a',
+      }),
+      useCase.execute({
+        ...submission,
+        idempotencyKey: 'provider-conflict-key-b',
+        correlationId: 'provider-conflict-correlation-b',
+      }),
+    ]);
+    const fulfilled = results.filter((result) => result.status === 'fulfilled');
+    const rejected = results.filter((result) => result.status === 'rejected');
+
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    if (rejected[0]?.status !== 'rejected') {
+      throw new Error('Expected one provider transaction submission to fail');
+    }
+    expect(rejected[0].reason).toBeInstanceOf(
+      ProviderTransactionConflictError,
+    );
+    expect(mapHttpError(rejected[0].reason)).toEqual(
+      expect.objectContaining({
+        status: 409,
+        body: expect.objectContaining({
+          statusCode: 409,
+          code: 'PROVIDER_TRANSACTION_CONFLICT',
+        }),
+      }),
+    );
+
+    const [counts] = await requiredApplicationOrm().em
+      .getConnection()
+      .execute<Array<{ outbox_count: string; transaction_count: string }>>(
+        `select
+           (select count(*)::text
+              from wager_transactions
+             where provider_id = ? and external_transaction_id = ?) as transaction_count,
+           (select count(*)::text
+              from outbox_messages
+             where event_type = 'ProviderIdentityProbeProcessed') as outbox_count`,
+        [providerId, externalTransactionId],
+      );
+    expect(counts).toEqual({ transaction_count: '1', outbox_count: '1' });
+    expect(
+      await new ReconcileWalletUseCase(unitOfWork).execute(walletId),
+    ).toEqual({
+      walletId,
+      storedBalance: { amount: '0.00', currency: 'BRL' },
+      calculatedBalance: { amount: '0.00', currency: 'BRL' },
+      difference: { amount: '0.00', currency: 'BRL' },
+      consistent: true,
+      checkedEntries: 0,
     });
   });
 

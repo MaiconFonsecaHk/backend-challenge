@@ -3,6 +3,7 @@ import { describe, expect, mock, test } from 'bun:test';
 import {
   IdempotencyConflictError,
   InboxPayloadConflictError,
+  ProviderTransactionConflictError,
 } from '../../../src/application/errors/wager-application.error.js';
 import type { PersistenceConflictClassifier } from '../../../src/application/ports/persistence/persistence-conflict-classifier.js';
 import type { OperationalMetrics } from '../../../src/application/ports/operational-metrics.js';
@@ -105,10 +106,21 @@ function wallet(): Wallet {
 class WagerRepositoryDouble {
   readonly added: WagerTransactionRecord[] = [];
 
-  constructor(private readonly found: Array<WagerTransactionRecord | undefined>) {}
+  constructor(
+    private readonly found: Array<WagerTransactionRecord | undefined>,
+    private readonly providerFound: Array<
+      WagerTransactionRecord | undefined
+    > = [],
+  ) {}
 
   async findByIdempotencyKey(): Promise<WagerTransactionRecord | undefined> {
     return this.found.shift();
+  }
+
+  async findByProviderTransaction(): Promise<
+    WagerTransactionRecord | undefined
+  > {
+    return this.providerFound.shift();
   }
 
   async add(record: WagerTransactionRecord): Promise<void> {
@@ -206,6 +218,7 @@ class ConflictClassifierDouble implements PersistenceConflictClassifier {
     private readonly matchingError: unknown,
     private readonly matchingInboxError?: unknown,
     private readonly matchingLockError?: unknown,
+    private readonly matchingProviderError?: unknown,
   ) {}
 
   isWagerIdempotencyKeyConflict(error: unknown): boolean {
@@ -214,6 +227,10 @@ class ConflictClassifierDouble implements PersistenceConflictClassifier {
 
   isInboxIdentityConflict(error: unknown): boolean {
     return error === this.matchingInboxError;
+  }
+
+  isWagerProviderTransactionConflict(error: unknown): boolean {
+    return error === this.matchingProviderError;
   }
 
   isLockConflict(error: unknown): boolean {
@@ -453,6 +470,48 @@ describe('PersistentWagerTransactionProcessor', () => {
     await expect(
       processor.process(command({ payloadHash: 'loser-hash' })),
     ).rejects.toBeInstanceOf(IdempotencyConflictError);
+  });
+
+  test('reports a provider transaction won by another idempotency key as a conflict', async () => {
+    const uniqueConflict = new Error('provider transaction unique conflict');
+    const winner = transactionRecord({ idempotencyKey: 'winner-key' });
+    const wagers = new WagerRepositoryDouble([undefined], [winner]);
+    const processor = new PersistentWagerTransactionProcessor(
+      new UnitOfWorkDouble(repositories(wagers), [uniqueConflict]),
+      new ExecutorDouble(transactionRecord({ idempotencyKey: 'loser-key' })),
+      new ConflictClassifierDouble(
+        undefined,
+        undefined,
+        undefined,
+        uniqueConflict,
+      ),
+    );
+
+    await expect(
+      processor.process(command({ idempotencyKey: 'loser-key' })),
+    ).rejects.toBeInstanceOf(ProviderTransactionConflictError);
+  });
+
+  test('still returns replay if PostgreSQL reports the provider constraint for the same key', async () => {
+    const uniqueConflict = new Error('provider transaction unique conflict');
+    const winner = transactionRecord();
+    const wagers = new WagerRepositoryDouble([undefined], [winner]);
+    const processor = new PersistentWagerTransactionProcessor(
+      new UnitOfWorkDouble(repositories(wagers), [uniqueConflict]),
+      new ExecutorDouble(transactionRecord()),
+      new ConflictClassifierDouble(
+        undefined,
+        undefined,
+        undefined,
+        uniqueConflict,
+      ),
+    );
+
+    expect(await processor.process(command())).toEqual({
+      transactionId: TRANSACTION_ID,
+      status: WagerTransactionStatus.Processed,
+      idempotentReplay: true,
+    });
   });
 
   test('propagates unrelated failures and the original conflict if no winner exists', async () => {

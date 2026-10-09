@@ -51,6 +51,24 @@ describe('MikroOrmPersistenceConflictClassifier', () => {
     ).toBe(false);
   });
 
+  test('matches only the provider transaction identity constraint', () => {
+    expect(
+      classifier.isWagerProviderTransactionConflict(
+        uniqueViolation('wager_transactions_provider_external_unique'),
+      ),
+    ).toBe(true);
+    expect(
+      classifier.isWagerProviderTransactionConflict(
+        uniqueViolation('wager_transactions_idempotency_key_unique'),
+      ),
+    ).toBe(false);
+    expect(
+      classifier.isWagerProviderTransactionConflict(
+        new Error('not a DB conflict'),
+      ),
+    ).toBe(false);
+  });
+
   test('matches only the inbox composite primary-key constraint', () => {
     expect(
       classifier.isInboxIdentityConflict(
