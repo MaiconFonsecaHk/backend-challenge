@@ -1,4 +1,11 @@
 import { afterAll, afterEach, beforeAll, describe, expect, test } from 'bun:test';
+import {
+  CreateQueueCommand,
+  DeleteQueueCommand,
+  ReceiveMessageCommand,
+  SendMessageCommand,
+  SQSClient,
+} from '@aws-sdk/client-sqs';
 import { Migrator } from '@mikro-orm/migrations';
 import { MikroORM } from '@mikro-orm/postgresql';
 
@@ -511,6 +518,105 @@ function spawnOutboxCrashWorker(now: Date) {
       stderr: 'pipe',
     },
   );
+}
+
+function spawnFinancialProcess(
+  command: Record<string, unknown>,
+  startAt: number,
+) {
+  return Bun.spawn(
+    [process.execPath, 'run', 'test/fixtures/financial-process-worker.ts'],
+    {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        FINANCIAL_PROCESS_COMMAND: JSON.stringify(command),
+        FINANCIAL_PROCESS_DATABASE: databaseName,
+        FINANCIAL_PROCESS_MODE: 'DIRECT',
+        FINANCIAL_PROCESS_NOW: PROCESSED_AT.toISOString(),
+        FINANCIAL_PROCESS_START_AT: String(startAt),
+      },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    },
+  );
+}
+
+async function readFinancialProcessResult(
+  worker: ReturnType<typeof spawnFinancialProcess>,
+): Promise<Record<string, unknown>> {
+  const [exitCode, stdout, stderr] = await Promise.all([
+    worker.exited,
+    new Response(worker.stdout).text(),
+    new Response(worker.stderr).text(),
+  ]);
+  if (exitCode !== 0) {
+    throw new Error(
+      `Financial process exited with ${exitCode}. Output: ${stdout}. Error: ${stderr}`,
+    );
+  }
+
+  return JSON.parse(stdout.trim()) as Record<string, unknown>;
+}
+
+function spawnSqsFinancialProcess(
+  mode: 'SQS_ACK' | 'SQS_CRASH',
+  queueUrl: string,
+) {
+  return Bun.spawn(
+    [process.execPath, 'run', 'test/fixtures/financial-process-worker.ts'],
+    {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        FINANCIAL_PROCESS_DATABASE: databaseName,
+        FINANCIAL_PROCESS_MODE: mode,
+        FINANCIAL_PROCESS_NOW: PROCESSED_AT.toISOString(),
+        FINANCIAL_PROCESS_QUEUE_URL: queueUrl,
+      },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    },
+  );
+}
+
+async function waitForFinancialProcessSignal(
+  worker: ReturnType<typeof spawnSqsFinancialProcess>,
+  expected: string,
+): Promise<string> {
+  const reader = worker.stdout.getReader();
+  const decoder = new TextDecoder();
+  let output = '';
+  const deadline = Date.now() + 15_000;
+
+  try {
+    while (!output.includes(expected)) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        throw new Error(
+          `Financial process did not emit ${expected}. Output: ${output}`,
+        );
+      }
+      const chunk = await Promise.race([
+        reader.read(),
+        Bun.sleep(remaining).then(() => {
+          throw new Error(
+            `Financial process timed out waiting for ${expected}.`,
+          );
+        }),
+      ]);
+      if (chunk.done) {
+        const stderr = await new Response(worker.stderr).text();
+        throw new Error(
+          `Financial process exited before ${expected}. Output: ${output}. Error: ${stderr}`,
+        );
+      }
+      output += decoder.decode(chunk.value, { stream: true });
+    }
+    return output;
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 async function waitForWorkerSignal(
@@ -1751,6 +1857,225 @@ describePostgreSql('PostgreSQL schema integration', () => {
       await Promise.all(instances.map((orm) => orm.close(true)));
     }
   });
+
+  test('serializes three independent Bun processes competing for one wallet', async () => {
+    const walletId = '10000000-0000-4000-8000-000000000119';
+    const playerId = '20000000-0000-4000-8000-000000000119';
+    const unitOfWork = new MikroOrmUnitOfWork(requiredApplicationOrm());
+    await createWalletUseCase(
+      unitOfWork,
+      new SequenceIdGenerator([
+        walletId,
+        '30000000-0000-4000-8000-000000000119',
+        '40000000-0000-4000-8000-000000000119',
+        '50000000-0000-4000-8000-000000000119',
+      ]),
+      new FixedClock(CREATED_AT),
+    ).execute({
+      playerId,
+      initialBalance: { amount: '100.00', currency: 'BRL' },
+      correlationId: 'wallet-process-integration-119',
+    });
+
+    const startAt = Date.now() + 2_000;
+    const workers = Array.from({ length: 3 }, (_, index) =>
+      spawnFinancialProcess(
+        {
+          providerId: 'provider-processes',
+          externalTransactionId: `bet-process-${index + 1}`,
+          idempotencyKey: `provider-processes:bet-${index + 1}`,
+          playerId,
+          walletId,
+          roundId: 'round-processes-119',
+          gameId: 'game-processes-119',
+          kind: WagerTransactionKind.Bet,
+          money: { amount: '80.00', currency: 'BRL' },
+          correlationId: `process-${index + 1}`,
+        },
+        startAt,
+      ),
+    );
+    const results = await Promise.all(workers.map(readFinancialProcessResult));
+
+    expect(
+      results.filter((result) => result.status === 'PROCESSED'),
+    ).toHaveLength(1);
+    expect(
+      results.filter(
+        (result) =>
+          result.status === 'REJECTED' &&
+          result.failureCode === 'INSUFFICIENT_FUNDS',
+      ),
+    ).toHaveLength(2);
+    expect(
+      results.every(
+        (result) =>
+          (result.balance as { amount?: string } | undefined)?.amount ===
+          '20.00',
+      ),
+    ).toBe(true);
+
+    const reconciliation = await new ReconcileWalletUseCase(unitOfWork).execute(
+      walletId,
+    );
+    expect(reconciliation).toEqual({
+      walletId,
+      storedBalance: { amount: '20.00', currency: 'BRL' },
+      calculatedBalance: { amount: '20.00', currency: 'BRL' },
+      difference: { amount: '0.00', currency: 'BRL' },
+      consistent: true,
+      checkedEntries: 2,
+    });
+  });
+
+  test('replays safely after a real consumer process dies between commit and ack', async () => {
+    const walletId = '10000000-0000-4000-8000-000000000120';
+    const playerId = '20000000-0000-4000-8000-000000000120';
+    const messageId = 'message-process-recovery-120';
+    const idempotencyKey = 'provider-process-recovery:bet-120';
+    const unitOfWork = new MikroOrmUnitOfWork(requiredApplicationOrm());
+    await createWalletUseCase(
+      unitOfWork,
+      new SequenceIdGenerator([
+        walletId,
+        '30000000-0000-4000-8000-000000000120',
+        '40000000-0000-4000-8000-000000000120',
+        '50000000-0000-4000-8000-000000000120',
+      ]),
+      new FixedClock(CREATED_AT),
+    ).execute({
+      playerId,
+      initialBalance: { amount: '100.00', currency: 'BRL' },
+      correlationId: 'wallet-process-recovery-120',
+    });
+
+    const sqsClient = new SQSClient({
+      endpoint: process.env.SQS_ENDPOINT ?? 'http://127.0.0.1:4566',
+      region: process.env.AWS_REGION ?? 'us-east-1',
+      credentials: {
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID ?? 'test',
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY ?? 'test',
+      },
+    });
+    const queueName = `process-recovery-${crypto.randomUUID().replaceAll('-', '').slice(0, 12)}.fifo`;
+    const queue = await sqsClient.send(
+      new CreateQueueCommand({
+        QueueName: queueName,
+        Attributes: { FifoQueue: 'true', VisibilityTimeout: '1' },
+      }),
+    );
+    if (queue.QueueUrl === undefined) {
+      throw new Error('SQS did not return the process-recovery queue URL.');
+    }
+    const queueUrl = queue.QueueUrl;
+
+    try {
+      const body = JSON.stringify({
+        messageId,
+        type: 'WagerTransactionRequested',
+        occurredAt: CREATED_AT.toISOString(),
+        data: {
+          providerId: 'provider-process-recovery',
+          externalTransactionId: 'bet-120',
+          idempotencyKey,
+          playerId,
+          walletId,
+          roundId: 'round-process-recovery-120',
+          gameId: 'game-process-recovery-120',
+          kind: WagerTransactionKind.Bet,
+          money: { amount: '25.00', currency: 'BRL' },
+        },
+      });
+      await sqsClient.send(
+        new SendMessageCommand({
+          QueueUrl: queueUrl,
+          MessageBody: body,
+          MessageGroupId: walletId,
+          MessageDeduplicationId: messageId,
+        }),
+      );
+
+      const crashingWorker = spawnSqsFinancialProcess('SQS_CRASH', queueUrl);
+      const firstOutput = await waitForFinancialProcessSignal(
+        crashingWorker,
+        'PROCESSED:',
+      );
+      expect(firstOutput).toContain('"idempotentReplay":false');
+      crashingWorker.kill();
+      await crashingWorker.exited;
+
+      const replacementWorker = spawnSqsFinancialProcess('SQS_ACK', queueUrl);
+      const [exitCode, stdout, stderr] = await Promise.all([
+        replacementWorker.exited,
+        new Response(replacementWorker.stdout).text(),
+        new Response(replacementWorker.stderr).text(),
+      ]);
+      expect(exitCode).toBe(0);
+      expect(stderr).toBe('');
+      expect(stdout).toContain('"idempotentReplay":true');
+      expect(stdout).toContain('"receiveCount":"2"');
+      expect(stdout).toContain('ACKED');
+
+      const processedLine = stdout
+        .split(/\r?\n/u)
+        .find((line) => line.startsWith('PROCESSED:'));
+      if (processedLine === undefined) {
+        throw new Error('Replacement process returned no processing result.');
+      }
+      const replayResult = JSON.parse(
+        processedLine.slice('PROCESSED:'.length),
+      ) as { transactionId: string };
+      const [counts] = await requiredApplicationOrm().em
+        .getConnection()
+        .execute<
+          Array<{
+            inbox_count: string;
+            ledger_count: string;
+            outbox_count: string;
+            transaction_count: string;
+          }>
+        >(
+          `select
+             (select count(*)::text from wager_transactions where idempotency_key = ?) as transaction_count,
+             (select count(*)::text from wallet_ledger_entries where transaction_id = ?) as ledger_count,
+             (select count(*)::text from inbox_messages where consumer_name = 'wager-transactions-consumer' and message_id = ?) as inbox_count,
+             (select count(*)::text from outbox_messages where payload -> 'data' ->> 'transactionId' = ?) as outbox_count`,
+          [
+            idempotencyKey,
+            replayResult.transactionId,
+            messageId,
+            replayResult.transactionId,
+          ],
+        );
+      expect(counts).toEqual({
+        transaction_count: '1',
+        ledger_count: '1',
+        inbox_count: '1',
+        outbox_count: '2',
+      });
+      expect(
+        await new ReconcileWalletUseCase(unitOfWork).execute(walletId),
+      ).toEqual({
+        walletId,
+        storedBalance: { amount: '75.00', currency: 'BRL' },
+        calculatedBalance: { amount: '75.00', currency: 'BRL' },
+        difference: { amount: '0.00', currency: 'BRL' },
+        consistent: true,
+        checkedEntries: 2,
+      });
+      const remaining = await sqsClient.send(
+        new ReceiveMessageCommand({
+          QueueUrl: queueUrl,
+          MaxNumberOfMessages: 1,
+          WaitTimeSeconds: 1,
+        }),
+      );
+      expect(remaining.Messages).toBeUndefined();
+    } finally {
+      await sqsClient.send(new DeleteQueueCommand({ QueueUrl: queueUrl }));
+      sqsClient.destroy();
+    }
+  }, 25_000);
 
   test('applies every wagering rule atomically and keeps wallet equal to its ledger', async () => {
     const walletId = '10000000-0000-4000-8000-000000000112';

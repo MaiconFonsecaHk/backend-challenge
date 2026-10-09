@@ -133,12 +133,12 @@ bun run test:integration:sqs
 
 Na baseline documentada:
 
-- `bun run test`: 424 testes aprovados;
-- `bun run test:integration:postgres`: 21 testes aprovados;
-- `bun run test:integration:sqs`: 4 testes aprovados;
+- `bun run test`: 433 testes aprovados;
+- `bun run test:integration:postgres`: 25 testes aprovados;
+- `bun run test:integration:sqs`: 5 testes aprovados;
 - type-check e build aprovados.
 
-As provas incluem 50 replays paralelos da mesma aposta, disputa simultânea de duas apostas de `80.00 BRL` contra `100.00 BRL`, três instâncias independentes, wallets distintas em paralelo, dois publishers, redelivery depois de commit e antes do ack, referência entregue fora de ordem e morte abrupta de um processo com retomada do claim da outbox.
+As provas incluem 50 replays paralelos da mesma aposta com um único débito, disputa simultânea de duas apostas de `80.00 BRL` contra `100.00 BRL`, três processos Bun independentes sobre a mesma wallet, wallets distintas em paralelo, dois publishers, bloqueio da ordem FIFO durante retry, redelivery depois de commit e morte real antes do ack, referência entregue fora de ordem e morte abrupta de um processo com retomada do claim da outbox.
 
 ### Endpoints
 
